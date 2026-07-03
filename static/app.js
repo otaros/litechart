@@ -1276,6 +1276,50 @@ const drawings = (() => {
     ell_triple:    { n: 6, labels: ["0", "W", "X", "Y", "X", "Z"], fill: false, name: "Elliott Triple Combo (W-X-Y-X-Z)" },
   };
   function patternPts(it) { return it.pts || []; }
+
+  // Draw a small rounded ratio label (TradingView style) centred at (x, y).
+  function drawRatioLabel(x, y, text, lc) {
+    if (!isFinite(x) || !isFinite(y)) return;
+    ctx.save();
+    ctx.font = "bold 11px 'Segoe UI'";
+    const padX = 6, padY = 3, w = ctx.measureText(text).width;
+    const bx = x - w / 2 - padX, by = y - 8 - padY, bw = w + padX * 2, bh = 16 + padY * 2 - 8;
+    ctx.fillStyle = hexA(lc, 0.16);
+    if (ctx.roundRect) { ctx.beginPath(); ctx.roundRect(bx, by, bw, bh, 4); ctx.fill(); }
+    else ctx.fillRect(bx, by, bw, bh);
+    ctx.fillStyle = lc;
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(text, x, by + bh / 2);
+    ctx.restore();
+  }
+
+  // ABCD-family ratio annotations. For 4 named points A,B,C,D this shows the
+  // BC/AB retracement (between A and C) and the CD/BC projection (between B
+  // and D), matching TradingView's ABCD / XABCD labels.
+  function drawAbcdRatios(it, ptsXY, lc) {
+    const raw = patternPts(it);
+    // Locate the A,B,C,D indices: last four points of the pattern.
+    const spec = PATTERN_SPECS[it.type];
+    if (!spec) return;
+    const n = raw.length;
+    if (n < spec.n) return;   // only annotate a completed pattern
+    const iA = spec.n - 4, iB = spec.n - 3, iC = spec.n - 2, iD = spec.n - 1;
+    const A = raw[iA], B = raw[iB], C = raw[iC], D = raw[iD];
+    const pA = ptsXY[iA], pB = ptsXY[iB], pC = ptsXY[iC], pD = ptsXY[iD];
+    if (!A || !B || !C || !D || !pA || !pB || !pC || !pD) return;
+    const ab = Math.abs(B.price - A.price);
+    const bc = Math.abs(C.price - B.price);
+    const cd = Math.abs(D.price - C.price);
+    if (ab > 1e-9) {
+      const r = (bc / ab).toFixed(3);
+      drawRatioLabel((pA.x + pC.x) / 2, (pA.y + pC.y) / 2, r, lc);
+    }
+    if (bc > 1e-9) {
+      const r = (cd / bc).toFixed(3);
+      drawRatioLabel((pB.x + pD.x) / 2, (pB.y + pD.y) / 2, r, lc);
+    }
+  }
+
   function drawPatternItem(it, emph) {
     const spec = PATTERN_SPECS[it.type]; if (!spec) return;
     const pts = patternPts(it).map(toXY);
@@ -1316,6 +1360,10 @@ const drawings = (() => {
         ctx.fillText(label, p.x + 5, p.y + (up ? -6 : 14));
       }
     });
+    // ABCD / XABCD ratio annotations (BC/AB and CD/BC).
+    if ((it.type === "abcd" || it.type === "xabcd") && valid.length === spec.n) {
+      drawAbcdRatios(it, pts, lc);
+    }
     ctx.restore();
   }
 
@@ -1351,6 +1399,58 @@ const drawings = (() => {
     ctx.restore();
   }
 
+  // Andrews' Pitchfork: 3 points. P0 is the pivot; the median line runs from
+  // P0 through the midpoint of P1–P2. Two "tine" lines start at P1 and P2 and
+  // run parallel to the median. All three rays extend to the right edge.
+  function drawPitchforkItem(it, emph) {
+    const pts = patternPts(it);
+    const P0 = pts[0] && toXY(pts[0]);
+    const P1 = pts[1] && toXY(pts[1]);
+    const P2 = pts[2] && toXY(pts[2]);
+    if (!P0 || !P1) return;
+    const lc = col(it, C.orange), lw = wid(it, 2);
+    ctx.save();
+    ctx.lineJoin = "round";
+    if (!P2) {
+      // Only two points placed so far → preview the base line P0→P1.
+      ctx.strokeStyle = lc; ctx.lineWidth = emph ? lw + 3 : lw;
+      ctx.beginPath(); ctx.moveTo(P0.x, P0.y); ctx.lineTo(P1.x, P1.y); ctx.stroke();
+      ctx.restore(); return;
+    }
+    const M = { x: (P1.x + P2.x) / 2, y: (P1.y + P2.y) / 2 };
+    // Direction of the median line (P0 → M), extended far to the right.
+    let dx = M.x - P0.x, dy = M.y - P0.y;
+    const len = Math.hypot(dx, dy) || 1;
+    dx /= len; dy /= len;
+    const FAR = (cv.clientWidth + cv.clientHeight) * 2;   // long enough to leave the pane
+    const ray = (from) => ({ x: from.x + dx * FAR, y: from.y + dy * FAR });
+    const mEnd = ray(M), t1End = ray(P1), t2End = ray(P2);
+
+    // Translucent fill between the two outer tines.
+    ctx.fillStyle = hexA(lc, 0.08);
+    ctx.beginPath();
+    ctx.moveTo(P1.x, P1.y); ctx.lineTo(t1End.x, t1End.y);
+    ctx.lineTo(t2End.x, t2End.y); ctx.lineTo(P2.x, P2.y);
+    ctx.closePath(); ctx.fill();
+
+    if (emph) {
+      ctx.strokeStyle = hexA(lc, 0.3); ctx.lineWidth = lw + 4;
+      ctx.beginPath();
+      ctx.moveTo(P0.x, P0.y); ctx.lineTo(M.x, M.y);
+      ctx.moveTo(P1.x, P1.y); ctx.lineTo(P2.x, P2.y);
+      ctx.stroke();
+    }
+    ctx.strokeStyle = lc; ctx.lineWidth = lw;
+    // Handle base line P1–P2.
+    ctx.beginPath(); ctx.moveTo(P1.x, P1.y); ctx.lineTo(P2.x, P2.y); ctx.stroke();
+    // Median line P0 → M → far.
+    ctx.beginPath(); ctx.moveTo(P0.x, P0.y); ctx.lineTo(mEnd.x, mEnd.y); ctx.stroke();
+    // Parallel tines from P1 and P2.
+    ctx.beginPath(); ctx.moveTo(P1.x, P1.y); ctx.lineTo(t1End.x, t1End.y); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(P2.x, P2.y); ctx.lineTo(t2End.x, t2End.y); ctx.stroke();
+    ctx.restore();
+  }
+
   const RENDER = {
     trendline: drawTrend, ray: drawRay, extended: drawExtended,
     hline: drawHLineItem, vline: drawVLineItem, crossline: drawCrossline,
@@ -1360,18 +1460,23 @@ const drawings = (() => {
     pricerange: drawRangeItem, daterange: drawRangeItem, rangebox: drawRangeItem,
     text: drawTextItem,
     sine: drawSineItem, cyclic: drawCyclicItem, timecycles: drawCyclicItem,
+    pitchfork: drawPitchforkItem,
   };
   // Every PATTERN_SPECS key renders through the shared polyline renderer.
   Object.keys(PATTERN_SPECS).forEach((k) => { RENDER[k] = drawPatternItem; });
   function isPattern(t) { return !!PATTERN_SPECS[t]; }
+  // Multi-point (pts-based) tools that aren't patterns: cycles + pitchfork.
+  // How many points each one needs to be committed.
+  const MULTIPT_N = { sine: 2, cyclic: 2, timecycles: 2, pitchfork: 3 };
+  function isMultiPt(t) { return isPattern(t) || MULTIPT_N[t] != null; }
   function renderItem(it, emph) { (RENDER[it.type] || (() => {}))(it, emph); }
 
   function handlePoints(it) {
     const out = [];
     if (it.type === "brush") return out;   // freehand: no endpoint handles
     if (it.type === "vline") { const x = logicalX(it.a.logical); if (x != null) out.push({ key: "p1", x, y: cv.clientHeight / 2 }); return out; }
-    // Multi-point tools (patterns / cycles): one handle per vertex.
-    if (isPattern(it.type) || it.type === "sine" || it.type === "cyclic" || it.type === "timecycles") {
+    // Multi-point tools (patterns / cycles / pitchfork): one handle per vertex.
+    if (isMultiPt(it.type)) {
       (it.pts || []).forEach((q, i) => { const P = toXY(q); if (P) out.push({ key: "v" + i, x: P.x, y: P.y }); });
       return out;
     }
@@ -1399,6 +1504,20 @@ const drawings = (() => {
     return null;
   }
   function hitItem(it, mx, my) {
+    // Pitchfork: hit near the base line, median, or either tine ray.
+    if (it.type === "pitchfork") {
+      const p = it.pts || [];
+      const P0 = p[0] && toXY(p[0]), P1 = p[1] && toXY(p[1]), P2 = p[2] && toXY(p[2]);
+      if (!P0 || !P1) return null;
+      if (!P2) return distToSeg(mx, my, P0.x, P0.y, P1.x, P1.y) <= HIT ? "body" : null;
+      const M = { x: (P1.x + P2.x) / 2, y: (P1.y + P2.y) / 2 };
+      let dx = M.x - P0.x, dy = M.y - P0.y; const len = Math.hypot(dx, dy) || 1; dx /= len; dy /= len;
+      const FAR = (cv.clientWidth + cv.clientHeight) * 2;
+      const ray = (f) => ({ x: f.x + dx * FAR, y: f.y + dy * FAR });
+      const segs = [[P1, P2], [P0, ray(M)], [P1, ray(P1)], [P2, ray(P2)]];
+      for (const [a, b] of segs) if (distToSeg(mx, my, a.x, a.y, b.x, b.y) <= HIT) return "body";
+      return null;
+    }
     // Cycle tools: vertical repeated lines / sine — hit near their anchors.
     if (it.type === "sine" || it.type === "cyclic" || it.type === "timecycles") {
       const p = it.pts || [];
@@ -1581,7 +1700,7 @@ const drawings = (() => {
     // N-point tools: chart patterns / Elliott (from spec), and the 2-point
     // cycle tools (sine, cyclic lines, time cycles). Click to drop each vertex;
     // the last vertex tracks the cursor until the count is reached.
-    const nNeeded = isPattern(tool) ? PATTERN_SPECS[tool].n : (tool === "sine" || tool === "cyclic" || tool === "timecycles" ? 2 : 0);
+    const nNeeded = isPattern(tool) ? PATTERN_SPECS[tool].n : (MULTIPT_N[tool] || 0);
     if (nNeeded) {
       if (!draft) { draft = { type: tool, pts: [pt, pt] }; }   // first anchor + moving point
       else {
@@ -1635,7 +1754,7 @@ const drawings = (() => {
       if (draft.type === "brush") { const pt = pxToData(m.x, m.y, false); if (pt) draft.pts.push(pt); }
       else if (draft.type === "fibext") {
         const pt = pxToData(m.x, m.y, true); if (pt) { if (draft.c !== undefined) draft.c = pt; else draft.b = pt; }
-      } else if (isPattern(draft.type) || draft.type === "sine" || draft.type === "cyclic" || draft.type === "timecycles") {
+      } else if (isMultiPt(draft.type)) {
         const pt = pxToData(m.x, m.y, true); if (pt && draft.pts && draft.pts.length) draft.pts[draft.pts.length - 1] = pt;
       } else { const pt = pxToData(m.x, m.y, true); if (pt) draft.b = pt; }
       redraw();
@@ -1852,6 +1971,7 @@ const TOOL_SVG = {
   daterange: '<path d="M3 12h18"/><path d="M5 8v8M19 8v8"/>',
   rangebox: '<rect x="4" y="4" width="16" height="16"/><path d="M4 12h16M12 4v16"/>',
   text: '<path d="M5 5h14M12 5v14"/>',
+  pitchfork: '<path d="M4 20L14 6"/><path d="M8 4L20 12"/><path d="M4 12L18 20"/><circle cx="4" cy="20" r="1.4"/>',
   // patterns
   xabcd: '<path d="M3 18l4-10 5 8 4-12 5 14"/>',
   cypher: '<path d="M3 16l5-8 4 6 4-10 5 12"/>',
@@ -1885,6 +2005,9 @@ const TOOL_GROUPS = [
       { key: "hline", label: "Horizontal Line", hint: "Alt+H" },
       { key: "vline", label: "Vertical Line", hint: "Alt+V" },
       { key: "crossline", label: "Cross Line", hint: "Alt+C" },
+    ] },
+    { title: "PITCHFORK", tools: [
+      { key: "pitchfork", label: "Pitchfork" },
     ] },
   ] },
   { id: "fib", title: "FIBONACCI", tools: [
@@ -2544,7 +2667,7 @@ document.getElementById("dt-delete").innerHTML = '<svg viewBox="0 0 24 24"><path
 // Drawings whose color/width the quick toolbar can meaningfully change.
 const STYLEABLE = new Set([
   "trendline", "ray", "extended", "arrow", "hline", "vline", "crossline", "rectangle", "ellipse", "brush",
-  "sine", "cyclic", "timecycles",
+  "sine", "cyclic", "timecycles", "pitchfork",
   "xabcd", "cypher", "headshoulders", "abcd", "triangle", "threedrives",
   "ell_impulse", "ell_correction", "ell_triangle", "ell_double", "ell_triple",
 ]);
