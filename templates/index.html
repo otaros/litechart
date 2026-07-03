@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>LiteChart</title>
+<script src="https://unpkg.com/lightweight-charts@5/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+  :root {
+    --bg: #131722; --panel: #1b2027; --panel2: #22262f; --border: #2a2e39;
+    --text: #d1d4dc; --text2: #787b86; --accent: #2962ff;
+    --green: #26a69a; --red: #ef5350;
+    --yellow: #f0b90b; --orange: #ff9800; --purple: #e040fb; --cyan: #26c6da; --blue: #42a5f5;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, "Segoe UI", Roboto, system-ui, sans-serif; font-size: 13px;
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  button { font-family: inherit; }
+
+  /* ── Top toolbar ── */
+  #topbar {
+    display: flex; align-items: center; gap: 4px; height: 42px;
+    padding: 0 8px; background: var(--bg); border-bottom: 1px solid var(--border); flex-shrink: 0;
+  }
+  .divider { width: 1px; height: 22px; background: var(--border); margin: 0 6px; }
+  #symbol {
+    height: 30px; width: 130px; padding: 0 10px; background: transparent; color: var(--text);
+    border: none; border-radius: 4px; font-size: 15px; font-weight: 700; letter-spacing: .3px;
+  }
+  #symbol:hover, #symbol:focus { background: var(--panel); outline: none; }
+  /* Watchlist */
+  #wl-star { padding: 0 8px; }
+  #wl-star svg { transition: fill .12s, color .12s; }
+  #wl-star.on { color: var(--yellow); }
+  #wl-star.on svg { fill: var(--yellow); }
+  .wl-wrap { position: relative; display: inline-flex; }
+  #wl-menu {
+    position: fixed; z-index: 60; min-width: 200px; max-height: 420px; overflow-y: auto;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 6px;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.6); display: none;
+  }
+  #wl-menu.open { display: block; }
+  .wl-head { display: flex; align-items: center; justify-content: space-between; padding: 4px 6px 8px; }
+  .wl-head b { font-size: 13px; }
+  #wl-close { background: transparent; border: none; color: var(--text2); cursor: pointer; font-size: 18px; line-height: 1; }
+  #wl-close:hover { color: var(--text); }
+  .wl-item {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    padding: 7px 8px; border-radius: 5px; cursor: pointer; font-size: 13px; font-weight: 600; color: var(--text);
+  }
+  .wl-item:hover { background: var(--panel2); }
+  .wl-item.on { background: rgba(41,98,255,0.14); color: #5b8dff; }
+  .wl-item .wl-rm { display: none; background: transparent; border: none; color: var(--text2); cursor: pointer; font-size: 15px; line-height: 1; padding: 0 2px; }
+  .wl-item:hover .wl-rm { display: inline; }
+  .wl-item .wl-rm:hover { color: var(--red); }
+  .wl-empty { color: var(--text2); font-size: 12px; padding: 6px 8px; }
+  .wl-empty.hidden { display: none; }
+  .tf {
+    height: 28px; min-width: 30px; padding: 0 8px; background: transparent; color: var(--text2);
+    border: none; border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: 600;
+  }
+  .tf:hover { background: var(--panel); color: var(--text); }
+  .tf.active { background: rgba(41,98,255,0.15); color: #5b8dff; }
+  .tf-more { display: inline-flex; align-items: center; gap: 2px; color: var(--text2); }
+  .tf-more .tf-more-label:not(:empty) { margin-right: 2px; color: #5b8dff; }
+  #tf-menu {
+    position: fixed; z-index: 46; min-width: 90px; background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: 6px; box-shadow: 0 12px 40px rgba(0,0,0,0.6); display: none;
+    max-height: calc(100vh - 12px); overflow-y: auto;
+  }
+  #tf-menu.open { display: block; }
+  #tf-menu h4 { font-size: 10px; color: var(--text2); letter-spacing: 1px; margin: 8px 8px 4px; }
+  #tf-menu h4:first-child { margin-top: 2px; }
+  .tf-menu-row {
+    padding: 6px 10px; border-radius: 5px; cursor: pointer; font-size: 13px; color: var(--text); font-weight: 600;
+  }
+  .tf-menu-row:hover { background: var(--panel2); }
+  .tf-menu-row.on { background: rgba(41,98,255,0.12); color: #5b8dff; }
+  .tb-btn {
+    display: flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px; background: transparent;
+    color: var(--text2); border: none; border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: 600;
+  }
+  .tb-btn:hover { background: var(--panel); color: var(--text); }
+  .spacer { flex: 1; }
+
+  /* ── Body: left rail + chart ── */
+  #body { flex: 1; display: flex; min-height: 0; }
+  #rail {
+    width: 46px; flex-shrink: 0; background: var(--bg); border-right: 1px solid var(--border);
+    display: flex; flex-direction: column; align-items: center; padding: 6px 0; gap: 3px;
+  }
+  .tool {
+    width: 34px; height: 34px; display: flex; align-items: center; justify-content: center;
+    background: transparent; color: var(--text2); border: none; border-radius: 6px; cursor: pointer;
+    font-size: 16px;
+  }
+  .tool:hover { background: var(--panel); color: var(--text); }
+  .tool.active { background: rgba(41,98,255,0.18); color: #5b8dff; }
+  .tool svg { width: 20px; height: 20px; stroke: currentColor; fill: none; stroke-width: 1.6; }
+  .rail-sep { width: 26px; height: 1px; background: var(--border); margin: 4px 0; }
+
+  /* Rail groups with fly-out arrow */
+  .rail-group { position: relative; display: flex; align-items: center; }
+  .rail-arrow {
+    position: absolute; right: -1px; bottom: -1px; width: 12px; height: 12px; padding: 0;
+    display: flex; align-items: center; justify-content: center; background: transparent;
+    color: var(--text2); border: none; cursor: pointer; border-radius: 3px;
+  }
+  .rail-group:hover .rail-arrow { color: var(--text); }
+  .rail-arrow svg { width: 12px; height: 12px; stroke: currentColor; fill: none; stroke-width: 2.4; transform: rotate(-90deg); }
+
+  /* Tool fly-out menu */
+  #tool-flyout {
+    position: fixed; z-index: 45; min-width: 220px; background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: 6px; box-shadow: 0 12px 40px rgba(0,0,0,0.6); display: none;
+    max-height: calc(100vh - 12px); overflow-y: auto;
+  }
+  #tool-flyout.open { display: block; }
+  #tool-flyout h4 { font-size: 10px; color: var(--text2); letter-spacing: 1px; margin: 8px 8px 4px; }
+  #tool-flyout h4:first-child { margin-top: 2px; }
+  .fly-row { display: flex; align-items: center; gap: 10px; padding: 7px 8px; border-radius: 5px; cursor: pointer; }
+  .fly-row:hover { background: var(--panel2); }
+  .fly-row.on { background: rgba(41,98,255,0.12); }
+  .fly-ic { display: flex; color: var(--text); }
+  .fly-ic svg { width: 20px; height: 20px; stroke: currentColor; fill: none; stroke-width: 1.6; }
+  .fly-lb { flex: 1; font-size: 13px; color: var(--text); }
+  .fly-hint { font-size: 11px; color: var(--text2); }
+
+  #main { flex: 1; display: flex; min-height: 0; position: relative; }
+  #chart-wrap { flex: 1; position: relative; min-width: 0; }
+  #chart { position: absolute; inset: 0; }
+
+  /* On-chart legends */
+  .legend {
+    position: absolute; left: 12px; z-index: 5; pointer-events: none; font-size: 12px; line-height: 1.5;
+    white-space: nowrap; text-shadow: 0 0 3px var(--bg), 0 0 3px var(--bg), 0 0 3px var(--bg);
+  }
+  .legend b { font-weight: 700; }
+  .legend .k { color: var(--text2); margin-left: 6px; }
+
+  /* Indicators dropdown */
+  #ind-menu {
+    position: fixed; top: 44px; left: 50%; z-index: 60; width: 300px; background: var(--panel);
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px; box-shadow: 0 12px 40px rgba(0,0,0,0.6); display: none;
+  }
+  #ind-menu.open { display: block; }
+  #ind-menu .ind-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+  #ind-menu .ind-head b { font-size: 14px; }
+  #ind-close { background: transparent; border: none; color: var(--text2); cursor: pointer; font-size: 20px; line-height: 1; }
+  #ind-close:hover { color: var(--text); }
+  #ind-search {
+    width: 100%; height: 30px; padding: 0 10px; margin-bottom: 6px; background: var(--panel2);
+    color: var(--text); border: 1px solid var(--border); border-radius: 5px; font-size: 13px;
+  }
+  #ind-search:focus { outline: none; border-color: var(--accent); }
+  #ind-list { max-height: 360px; overflow-y: auto; }
+  #ind-menu h4 { font-size: 10px; color: var(--text2); letter-spacing: 1px; margin: 8px 6px 4px; }
+  .ind-add { display: flex; align-items: center; justify-content: space-between; cursor: pointer; font-size: 13px; padding: 6px 8px; border-radius: 4px; }
+  .ind-add:hover { background: var(--panel2); }
+  .ind-add .add-plus { color: var(--text2); font-size: 16px; }
+  .ind-add:hover .add-plus { color: var(--accent); }
+  .ind-add.hidden { display: none; }
+  .dot { width: 9px; height: 9px; border-radius: 2px; display: inline-block; flex-shrink: 0; }
+
+  /* Legend rows with per-indicator controls */
+  .lg-row { display: flex; align-items: center; gap: 2px; }
+  .lg-row .k { color: var(--text2); margin-left: 4px; }
+  .lg-osc { position: absolute; left: 0; white-space: nowrap; }
+  .ind-row .lg-btns { display: none; margin-left: 6px; pointer-events: auto; }
+  .ind-row:hover .lg-btns { display: inline-flex; gap: 1px; }
+  .lg-btn { background: transparent; border: none; color: var(--text2); cursor: pointer; padding: 1px 2px; border-radius: 3px; }
+  .lg-btn:hover { color: var(--text); background: var(--panel2); }
+  .lg-btn svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 1.8; display: block; }
+  .legend { pointer-events: none; }
+  .legend .ind-row { pointer-events: auto; }
+
+  /* Settings popover — floats inline, anchored under the indicator's gear */
+  #settings { position: fixed; inset: 0; z-index: 40; display: none; }
+  #settings.open { display: block; }
+  #settings .dlg-backdrop { position: absolute; inset: 0; background: transparent; }
+  .dlg-box { position: absolute; width: 320px; max-height: 70vh; display: flex; flex-direction: column; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 12px 40px rgba(0,0,0,0.6); }
+  .dlg-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px 10px; }
+  .dlg-head h3 { font-size: 16px; font-weight: 700; }
+  #dlg-close { background: transparent; border: none; color: var(--text2); cursor: pointer; font-size: 20px; line-height: 1; }
+  #dlg-close:hover { color: var(--text); }
+  .dlg-tabs { display: flex; gap: 18px; padding: 0 16px; border-bottom: 1px solid var(--border); }
+  .dlg-tab { background: transparent; border: none; color: var(--text2); cursor: pointer; font-size: 13px; font-weight: 600; padding: 8px 0; border-bottom: 2px solid transparent; }
+  .dlg-tab.active { color: var(--text); border-bottom-color: var(--accent); }
+  .dlg-body { padding: 16px; overflow-y: auto; }
+  .dlg-field { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+  .dlg-group { font-size: 10px; color: var(--text2); letter-spacing: 1px; margin: 16px 0 8px; font-weight: 600; }
+  .dlg-group:first-child { margin-top: 0; }
+  .dlg-field label { color: var(--text2); font-size: 13px; }
+  .dlg-field.disabled { opacity: 0.4; }
+  .dlg-field input[type=checkbox] { width: 16px; height: 16px; accent-color: var(--accent); }
+  .dlg-field input, .dlg-field select { width: 130px; height: 30px; background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 5px; padding: 0 8px; font-size: 13px; }
+  .dlg-field input:focus, .dlg-field select:focus { outline: none; border-color: var(--accent); }
+  .dlg-style-row { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+  .dlg-style-row .dlg-plot { flex: 1; color: var(--text2); font-size: 13px; }
+  .dlg-style-row input[type=color] { width: 34px; height: 26px; background: none; border: 1px solid var(--border); border-radius: 4px; padding: 0; cursor: pointer; }
+  .dlg-style-row input[type=checkbox] { width: 15px; height: 15px; accent-color: var(--accent); }
+  .dlg-style-row select { height: 26px; background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 4px; }
+  .dlg-empty { color: var(--text2); font-size: 13px; }
+  .dlg-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--border); }
+  .dlg-foot button { height: 32px; padding: 0 16px; border-radius: 6px; border: 1px solid var(--border); background: var(--panel2); color: var(--text); cursor: pointer; font-size: 13px; }
+  .dlg-foot button:hover { border-color: var(--accent); }
+  #dlg-ok, #draw-ok { background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 600; }
+
+  /* Drawing settings dialog (shares .dlg-* styles) */
+  #draw-settings { position: fixed; inset: 0; z-index: 60; display: none; }
+  #draw-settings.open { display: block; }
+  #draw-settings .dlg-backdrop { position: absolute; inset: 0; background: rgba(0,0,0,0.25); }
+  #draw-settings .dlg-box { width: 340px; }
+  .fib-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 14px; }
+  .fib-lvl { display: flex; align-items: center; gap: 6px; }
+  .fib-lvl input[type=checkbox] { width: 15px; height: 15px; accent-color: var(--accent); flex-shrink: 0; }
+  .fib-lvl input[type=number] { flex: 1; width: 100%; height: 26px; background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 0 6px; font-size: 12px; }
+  .fib-lvl input[type=color] { width: 30px; height: 24px; background: none; border: 1px solid var(--border); border-radius: 4px; padding: 0; cursor: pointer; flex-shrink: 0; }
+  .coord-row { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+  .coord-row .coord-label { color: var(--text2); font-size: 13px; width: 90px; }
+  .coord-row input { flex: 1; height: 30px; background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 5px; padding: 0 8px; font-size: 13px; }
+  .coord-row input:focus { outline: none; border-color: var(--accent); }
+
+  /* Floating drawing toolbar (appears on select) */
+  #draw-toolbar {
+    position: fixed; z-index: 55; display: none; align-items: center; gap: 2px;
+    padding: 3px; background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; box-shadow: 0 6px 24px rgba(0,0,0,0.5);
+  }
+  #draw-toolbar.open { display: flex; }
+  #draw-toolbar .dt-grip { color: var(--text2); font-size: 11px; padding: 0 3px; cursor: grab; letter-spacing: -2px; user-select: none; }
+  #draw-toolbar .dt-btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 4px;
+    min-width: 30px; height: 30px; padding: 0 6px; border: none; background: transparent;
+    color: var(--text); border-radius: 6px; cursor: pointer; font-size: 12px;
+  }
+  #draw-toolbar .dt-btn:hover { background: var(--panel2); }
+  #draw-toolbar .dt-btn svg { width: 17px; height: 17px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  #draw-toolbar .dt-swatch { width: 18px; height: 18px; border-radius: 4px; border: 1px solid var(--border); background: linear-gradient(90deg,#f23645,#ff9800,#4caf50,#00bcd4,#2962ff,#e040fb); }
+  #dt-color-input { position: fixed; width: 0; height: 0; opacity: 0; border: none; padding: 0; }
+  #dt-width-menu {
+    position: fixed; z-index: 56; display: none; flex-direction: column; padding: 4px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 6px 24px rgba(0,0,0,0.5);
+  }
+  #dt-width-menu.open { display: flex; }
+  #dt-width-menu button { background: transparent; border: none; color: var(--text); cursor: pointer; padding: 6px 14px; border-radius: 5px; font-size: 12px; text-align: left; }
+  #dt-width-menu button:hover { background: var(--panel2); }
+
+  /* Bottom timeframe strip */
+  #bottombar {
+    display: flex; align-items: center; gap: 2px; height: 30px; padding: 0 8px; background: var(--bg);
+    border-top: 1px solid var(--border); flex-shrink: 0;
+  }
+  #bottombar .brand { color: var(--text2); font-size: 11px; margin-right: 8px; }
+  #status { margin-left: auto; color: var(--text2); font-size: 11px; }
+  #status.error { color: var(--red); }
+</style>
+</head>
+<body>
+  <!-- Top toolbar -->
+  <div id="topbar">
+    <input id="symbol" placeholder="Symbol" value="AAPL" spellcheck="false" />
+    <button class="tb-btn" id="wl-star" title="Add to watchlist">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round">
+        <path d="M12 3.5l2.6 5.3 5.9.9-4.3 4.1 1 5.8L12 17l-5.2 2.6 1-5.8L3.5 9.7l5.9-.9z"/>
+      </svg>
+    </button>
+    <div class="wl-wrap">
+      <button class="tb-btn" id="wl-toggle" title="Watchlist">Watchlist &#9662;</button>
+      <div id="wl-menu">
+        <div class="wl-head"><b>Watchlist</b><button id="wl-close" title="Close">&times;</button></div>
+        <div id="wl-list"></div>
+        <div id="wl-empty" class="wl-empty">No symbols yet — add one with the star.</div>
+      </div>
+    </div>
+    <div class="divider"></div>
+    <div id="tfs" style="display:flex;gap:2px"></div>
+    <div class="divider"></div>
+    <button class="tb-btn" id="ind-toggle">&fnof; Indicators</button>
+    <div class="spacer"></div>
+  </div>
+
+  <div id="body">
+    <!-- Left drawing rail -->
+    <div id="rail"></div>
+
+    <div id="main">
+      <div id="chart-wrap">
+        <div id="chart"></div>
+        <div class="legend" id="lg-price" style="top:8px"></div>
+        <div class="legend" id="lg-panes"></div>
+      </div>
+
+      <!-- Indicators dropdown -->
+      <div id="ind-menu">
+        <div class="ind-head"><b>Indicators</b><button id="ind-close" title="Close">&times;</button></div>
+        <input id="ind-search" placeholder="Search indicators…" autocomplete="off" spellcheck="false" />
+        <div id="ind-list"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Bottom timeframe strip -->
+  <div id="bottombar">
+    <span class="brand">LiteChart</span>
+    <div id="tfs-bottom" style="display:flex;gap:2px"></div>
+    <span id="status">Ready</span>
+  </div>
+
+  <!-- Indicator settings popover (anchored inline under the indicator) -->
+  <div id="settings">
+    <div class="dlg-backdrop"></div>
+    <div class="dlg-box">
+      <div class="dlg-head">
+        <h3 id="dlg-title">Indicator</h3>
+        <button id="dlg-close">&times;</button>
+      </div>
+      <div class="dlg-tabs">
+        <button class="dlg-tab active" data-tab="inputs">Inputs</button>
+        <button class="dlg-tab" data-tab="style">Style</button>
+      </div>
+      <div class="dlg-body">
+        <div id="tab-inputs"></div>
+        <div id="tab-style" style="display:none"></div>
+      </div>
+      <div class="dlg-foot">
+        <button id="dlg-apply">Apply</button>
+        <button id="dlg-cancel">Cancel</button>
+        <button id="dlg-ok">Ok</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="draw-settings">
+    <div class="dlg-backdrop"></div>
+    <div class="dlg-box">
+      <div class="dlg-head">
+        <h3 id="draw-title">Drawing</h3>
+        <button id="draw-close">&times;</button>
+      </div>
+      <div class="dlg-tabs">
+        <button class="dlg-tab active" data-dtab="style">Style</button>
+        <button class="dlg-tab" data-dtab="coords">Coordinates</button>
+      </div>
+      <div class="dlg-body">
+        <div id="dtab-style"></div>
+        <div id="dtab-coords" style="display:none"></div>
+      </div>
+      <div class="dlg-foot">
+        <button id="draw-cancel">Cancel</button>
+        <button id="draw-ok">Ok</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="draw-toolbar">
+    <span class="dt-grip">⋮⋮</span>
+    <button class="dt-btn" id="dt-color" title="Color">
+      <span class="dt-swatch"></span>
+    </button>
+    <input type="color" id="dt-color-input" />
+    <button class="dt-btn" id="dt-width" title="Line width"><span id="dt-width-label">2px</span></button>
+    <div id="dt-width-menu"></div>
+    <button class="dt-btn" id="dt-settings" title="Settings"></button>
+    <button class="dt-btn" id="dt-delete" title="Delete"></button>
+  </div>
+
+<script src="/static/app.js?v={{ ver }}"></script>
+</body>
+</html>

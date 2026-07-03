@@ -1,0 +1,6 @@
+# Web backend — server.py (TradingView Lightweight Charts frontend via CDN)
+Flask>=2.2
+yfinance>=0.2
+pandas>=2.0
+numpy>=1.24
+curl_cffi>=0.6
