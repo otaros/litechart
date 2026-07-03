@@ -10,11 +10,13 @@ Run:
 then open http://127.0.0.1:5000
 """
 
+import atexit
 import os
 import signal
 import socket
 import ssl
 import subprocess
+import tempfile
 import time
 
 # Disable SSL verification — must happen before any network import.
@@ -981,6 +983,196 @@ def _reclaim_port(port: int) -> None:
         time.sleep(0.1)
 
 
+# ─────────────────────── Process lifecycle cleanup ─────────────────────
+# Flask's reloader runs TWO processes: a supervisor parent and a worker
+# child (WERKZEUG_RUN_MAIN=true) that actually binds the port. If the
+# terminal is killed, the parent can die while the worker is orphaned and
+# keeps holding the port. We guard against this three ways:
+#   1) Windows Job Object with KILL_ON_JOB_CLOSE — the OS kills the worker
+#      the instant the parent dies, even on a hard/unclean kill. This is the
+#      real fix for "I closed the terminal but python keeps serving".
+#   2) atexit + signal handlers so a graceful shutdown tears the worker down.
+#   3) A PID file so the NEXT startup reaps any tree that somehow survived.
+def _assign_to_kill_on_close_job(pid: int) -> bool:
+    """Put `pid` in a Windows Job that dies when THIS process's handle closes.
+
+    The job handle is kept alive for the lifetime of the (parent) process.
+    When the parent exits for ANY reason — clean exit, Ctrl+C, or the OS
+    force-terminating it because the terminal was closed — Windows closes the
+    handle and, because of JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, kills every
+    process assigned to the job (i.e. the reloader worker). Returns True on
+    success. No-op on non-Windows.
+    """
+    if os.name != "nt" or not pid:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.POINTER(ctypes.c_ulong)),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [(n, ctypes.c_uint64) for n in (
+                "ReadOperationCount", "WriteOperationCount",
+                "OtherOperationCount", "ReadTransferCount",
+                "WriteTransferCount", "OtherTransferCount")]
+
+        class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                ("IoInfo", IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+        JobObjectExtendedLimitInformation = 9
+        PROCESS_SET_QUOTA = 0x0100
+        PROCESS_TERMINATE = 0x0001
+
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            return False
+        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not kernel32.SetInformationJobObject(
+                job, JobObjectExtendedLimitInformation,
+                ctypes.byref(info), ctypes.sizeof(info)):
+            kernel32.CloseHandle(job)
+            return False
+        hproc = kernel32.OpenProcess(
+            PROCESS_SET_QUOTA | PROCESS_TERMINATE, False, pid)
+        if not hproc:
+            kernel32.CloseHandle(job)
+            return False
+        ok = kernel32.AssignProcessToJobObject(job, hproc)
+        kernel32.CloseHandle(hproc)
+        if not ok:
+            kernel32.CloseHandle(job)
+            return False
+        # Intentionally keep `job` alive by stashing it on a module global so
+        # the handle isn't garbage-collected (which would close it early).
+        global _KILL_JOB_HANDLE
+        _KILL_JOB_HANDLE = job
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+_KILL_JOB_HANDLE = None
+
+
+def _pidfile_path(port: int) -> str:
+    return os.path.join(tempfile.gettempdir(), f"litechart-{port}.pid")
+
+
+def _kill_tree(pid: int) -> None:
+    """Kill a process and all of its descendants, cross-platform."""
+    if not pid or pid == os.getpid():
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            # Kill the process group if we can, else just the pid.
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+            except Exception:  # noqa: BLE001
+                os.kill(pid, signal.SIGKILL)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _reap_previous_instance(port: int) -> None:
+    """Kill a stale LiteChart parent (and its worker) from a prior run."""
+    path = _pidfile_path(port)
+    try:
+        with open(path, "r") as fh:
+            old_pid = int((fh.read() or "0").strip())
+    except Exception:  # noqa: BLE001
+        return
+    if old_pid and old_pid != os.getpid():
+        print(f"Reaping previous LiteChart instance (pid {old_pid}).")
+        _kill_tree(old_pid)
+        for _ in range(20):
+            if not _port_in_use(port):
+                break
+            time.sleep(0.1)
+
+
+def _write_pidfile(port: int) -> None:
+    try:
+        with open(_pidfile_path(port), "w") as fh:
+            fh.write(str(os.getpid()))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _install_parent_cleanup(port: int) -> None:
+    """Ensure the reloader child is torn down when the parent exits."""
+    path = _pidfile_path(port)
+
+    def _cleanup(*_args):
+        # Kill our direct child (the reloader worker) and its descendants.
+        # On Windows, taskkill /T on our own PID would also target us, so we
+        # target the worker by finding the process holding the port instead.
+        worker = _pid_on_port(port)
+        if worker and worker != os.getpid():
+            _kill_tree(worker)
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:  # noqa: BLE001
+            pass
+
+    atexit.register(_cleanup)
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, lambda *_a: (_cleanup(), os._exit(0)))
+        except Exception:  # noqa: BLE001
+            pass
+    if os.name == "nt":
+        try:
+            signal.signal(signal.SIGBREAK, lambda *_a: (_cleanup(), os._exit(0)))
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Windows: attach the reloader worker to a kill-on-close Job Object so the
+    # OS reaps it if the parent is force-terminated (e.g. terminal closed)
+    # without a catchable signal. The reloader spawns a NEW worker on every
+    # code edit, so keep watching and re-bind whenever the worker PID changes.
+    if os.name == "nt":
+        import threading
+
+        def _watch_and_bind():
+            bound_pid = None
+            while True:
+                worker = _pid_on_port(port)
+                if worker and worker != os.getpid() and worker != bound_pid:
+                    if _assign_to_kill_on_close_job(worker):
+                        bound_pid = worker
+                        print(f"Worker (pid {worker}) bound to kill-on-close job.")
+                time.sleep(0.5)
+
+        threading.Thread(target=_watch_and_bind, daemon=True).start()
+
+
 if __name__ == "__main__":
     import webbrowser
     from threading import Timer
@@ -995,7 +1187,10 @@ if __name__ == "__main__":
     # once, in the parent, before the worker tries to bind.
     is_worker = os.environ.get("WERKZEUG_RUN_MAIN") == "true"
     if not is_worker:
-        _reclaim_port(port)
+        _reap_previous_instance(port)   # kill a leftover parent+worker tree
+        _reclaim_port(port)             # then reclaim the port if still held
+        _write_pidfile(port)            # record us so the NEXT run can reap us
+        _install_parent_cleanup(port)   # tear down our worker on exit
         # Auto-opening the browser is opt-in. Set OPEN_BROWSER=1 to enable.
         if os.environ.get("OPEN_BROWSER", "").strip() in ("1", "true", "yes"):
             Timer(1.2, lambda: webbrowser.open(url)).start()
