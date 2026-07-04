@@ -96,10 +96,15 @@ function hslToHex(h, s, l) {
   const to = (x) => Math.round(255 * x).toString(16).padStart(2, "0");
   return `#${to(f(0))}${to(f(8))}${to(f(4))}`;
 }
+// Golden-angle hue stepper: each successive color lands far away on the wheel
+// (137.5° apart), so MAs cycle through red→orange→yellow→green→cyan→blue→purple
+// instead of clustering in one hue family. Random start keeps sessions varied.
+let _hueCursor = Math.random() * 360;
 function randomContrastColor() {
-  const hue = Math.floor(Math.random() * 360);
-  const sat = 70 + Math.floor(Math.random() * 25);   // 70–95% saturation
-  const light = 58 + Math.floor(Math.random() * 12);  // 58–70% lightness (bright on dark bg)
+  _hueCursor = (_hueCursor + 137.508) % 360;
+  const hue = Math.floor(_hueCursor);
+  const sat = 72 + Math.floor(Math.random() * 20);    // 72–92% saturation
+  const light = 55 + Math.floor(Math.random() * 12);  // 55–67% lightness (bright on dark bg)
   return hslToHex(hue, sat, light);
 }
 
