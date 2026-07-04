@@ -399,7 +399,7 @@ function ensureSeries(inst) {
     // price lines / bands for oscillator panes (only once, on first series)
     if (!inst.overlay && inst.pane && inst.pane.bands && inst.series[0]) {
       inst.pane.bands.forEach((b) => inst.series[0].createPriceLine({
-        price: b, color: "rgba(120,123,134,0.4)", lineStyle: 2, lineWidth: 1, axisLabelVisible: true,
+        price: b, color: "rgba(180,185,196,0.9)", lineStyle: 2, lineWidth: 1, axisLabelVisible: true,
       }));
     }
     if (inst.data) applyInstanceData(inst);
@@ -652,6 +652,91 @@ function setStatus(msg, isError = false) {
   el.textContent = msg; el.classList.toggle("error", isError);
 }
 
+// How far into the FUTURE to reserve empty space per timeframe (seconds). The
+// span is scaled to the timeframe so intraday charts don't waste memory on
+// thousands of whitespace bars while weekly/monthly reach far enough out.
+const DAY = 86400, WEEK = 7 * DAY, YEAR = 365 * DAY;
+const FUTURE_SPAN = {
+  "1m": 1 * DAY, "2m": 2 * DAY, "3m": 3 * DAY, "5m": WEEK,
+  "10m": 2 * WEEK, "15m": 2 * WEEK, "30m": 3 * WEEK, "45m": 4 * WEEK,
+  "1h": 4 * WEEK, "2h": 6 * WEEK, "3h": 8 * WEEK, "4h": 12 * WEEK,
+  "1D": 2 * YEAR, "1W": 10 * YEAR, "1M": 20 * YEAR,
+};
+function futureSpanFor(tf) { return FUTURE_SPAN[tf] || 2 * YEAR; }
+
+// Generate empty future bars (whitespace: {time} only) extending a
+// timeframe-appropriate distance to the right of the last real candle, so
+// drawings can be anchored past the current data — mirroring TradingView's
+// reserved future space. Uses the typical bar step; for daily+ we skip
+// weekends to keep the projected dates realistic.
+function buildFutureWhitespace(candles, tf) {
+  if (!candles || candles.length < 2) return [];
+  const n = candles.length;
+  const last = candles[n - 1].time;
+  // Robust step: median of the last several gaps (avoids weekend outliers).
+  const gaps = [];
+  for (let i = Math.max(1, n - 20); i < n; i++) gaps.push(candles[i].time - candles[i - 1].time);
+  gaps.sort((a, b) => a - b);
+  const step = gaps[Math.floor(gaps.length / 2)] || DAY;
+  const span = futureSpanFor(tf);
+  // Bar count from the span, but hard-capped so intraday (where the calendar
+  // span ÷ small step could be huge) never balloons memory. Each whitespace
+  // bar is just {time}, so these caps are generous.
+  const MAX_BARS = { intraday: 600, daily: 520, weekly: 520, monthly: 240 };
+  let cap = MAX_BARS.daily;
+  if (step < DAY) cap = MAX_BARS.intraday;
+  else if (step >= 25 * DAY) cap = MAX_BARS.monthly;   // ~monthly bars
+  else if (step >= 5 * DAY) cap = MAX_BARS.weekly;     // ~weekly bars
+  const count = Math.min(cap, Math.max(1, Math.round(span / step)));
+  const daily = step >= DAY;           // skip weekends for daily-and-up
+  const out = [];
+  let t = last;
+  for (let i = 0; i < count; i++) {
+    t += step;
+    if (daily) {
+      // Skip Sat(6)/Sun(0) so future daily dates fall on weekdays.
+      let day = new Date(t * 1000).getUTCDay();
+      while (day === 0 || day === 6) { t += DAY; day = new Date(t * 1000).getUTCDay(); }
+    }
+    out.push({ time: t });
+  }
+  return out;
+}
+
+// Position the view at the LATEST bars (right edge), like most charting apps,
+// showing a recent window rather than the whole history. A small right margin
+// keeps a peek of the reserved future space. `bars` controls how many recent
+// candles are visible (defaults to ~160).
+let _fitToken = 0;
+function fitRealContent(bars = 160) {
+  const real = window.__realBars || (window.__bars ? window.__bars.length : 0);
+  if (real <= 0) { chart.timeScale().fitContent(); return; }
+  const rightPad = 8;                       // peek into future whitespace
+  const to = real - 1 + rightPad;
+  const from = Math.max(-1, real - 1 - bars);
+  const set = () => chart.timeScale().setVisibleLogicalRange({ from, to });
+  // Indicator series load ASYNCHRONOUSLY and each setData() can trigger an
+  // internal auto-scroll that yanks the view off the latest bar (worse on
+  // intraday, where indicators resolve after our initial fit). Re-assert the
+  // range across a few frames/ticks so we win those late scrolls. A token
+  // guards against a newer load stomping an older one's timers.
+  const myToken = ++_fitToken;
+  // Only re-assert if the view got auto-scrolled AWAY from our target (a late
+  // indicator setData bounced it). If the current right edge is already near
+  // `to`, assume the user is intentionally positioned and leave it alone — so
+  // we don't fight a deliberate scroll.
+  const reassert = () => {
+    if (myToken !== _fitToken) return;
+    const cur = chart.timeScale().getVisibleLogicalRange();
+    if (!cur || Math.abs(cur.to - to) > 2) set();
+  };
+  set();
+  requestAnimationFrame(reassert);
+  setTimeout(reassert, 60);
+  setTimeout(reassert, 200);
+  setTimeout(reassert, 500);
+}
+
 async function loadData() {
   const requested = document.getElementById("symbol").value.trim().toUpperCase() || "AAPL";
   const symbolChanged = requested !== currentSymbol;
@@ -663,11 +748,17 @@ async function loadData() {
     const data = await res.json();
     if (data.error) { setStatus("Error: " + data.error, true); return; }
     lastData = data;
-    window.__bars = data.candles;
+    const prevBars = window.__bars;   // snapshot for same-symbol re-anchoring
+    // Reserve empty FUTURE bars (like TradingView) so drawings can be placed
+    // and saved past the last real candle. These are whitespace points (time
+    // only, no OHLC) that extend the time axis ~2 years to the right.
+    const future = buildFutureWhitespace(data.candles, currentTf);
+    window.__bars = data.candles.concat(future);
+    window.__realBars = data.candles.length;   // count of actual (non-whitespace) bars
     // Volume aligned to bar index (Date Range tool sums this over a span).
     window.__vol = (data.volume || []).map((p) => (p && typeof p.value === "number" ? p.value : 0));
     priceOverride = null;
-    candleSeries.setData(data.candles);
+    candleSeries.setData(data.candles.concat(future));
     volumeSeries.setData(data.volume);
     watermark.applyOptions({ lines: [{ text: data.symbol, color: "rgba(120,123,134,0.10)", fontSize: 62 }] });
     // Switched tickers → swap in this symbol's own saved indicator layout.
@@ -678,9 +769,14 @@ async function loadData() {
       drawings.loadDrawings(loadDrawingsForSymbol(currentSymbol));
     } else {
       refetchAll();   // same symbol (e.g. timeframe change) → recompute in place
-      drawings.redraw();
+      // Re-pin drawings to their timestamps in case the new data shifted bar
+      // indices (e.g. more history loaded), so they stay on the same candles.
+      if (drawings.reanchor) drawings.reanchor(prevBars);
+      else drawings.redraw();
     }
-    chart.timeScale().fitContent();
+    // Fit to the REAL bars only (the future whitespace would otherwise zoom
+    // the view way out). A little right padding keeps a peek of future space.
+    fitRealContent();
     sizePanes();
     applySavedLayout();
     renderLegends();
@@ -1830,6 +1926,26 @@ const drawings = (() => {
     if (onToolChange) onToolChange(t);
     redraw();
   }
+  // When the overlay is capturing pointer events (a tool is armed, or hovering
+  // a drawing), the chart's own canvas never receives wheel events, so zoom
+  // stops working. Forward wheel here to zoom the time scale around the cursor,
+  // mirroring lightweight-charts' native behaviour. The price-axis vertical
+  // stretch is handled separately by the chartEl handler and takes priority.
+  cv.addEventListener("wheel", (e) => {
+    const ts = chart.timeScale();
+    const range = ts.getVisibleLogicalRange();
+    if (!range) return;
+    e.preventDefault(); e.stopPropagation();
+    const m = mousePx(e);
+    const pivot = ts.coordinateToLogical(m.x);
+    const p = (pivot == null) ? (range.from + range.to) / 2 : pivot;
+    // Wheel up (deltaY < 0) → zoom in; down → zoom out. Match LC's ~10%/notch.
+    const factor = e.deltaY > 0 ? 1.1 : 1 / 1.1;
+    const from = p - (p - range.from) * factor;
+    const to = p + (range.to - p) * factor;
+    if (to - from > 0.5) ts.setVisibleLogicalRange({ from, to });
+    redraw();
+  }, { passive: false });
   chartEl.addEventListener("mousemove", (e) => {
     if (tool !== "cursor" || drag || draft) return;
     const m = mousePx(e); const hit = pick(m.x, m.y);
@@ -1838,6 +1954,22 @@ const drawings = (() => {
     cv.style.cursor = hit ? (hit.part === "body" ? "move" : "pointer") : "default";
     redraw();
   });
+  // While the overlay is capturing pointer events (tool armed, or hovering /
+  // dragging a drawing), the chart's own canvas gets no mousemove, so the
+  // native crosshair (the two perpendicular dashed lines) freezes/vanishes.
+  // Forward the cursor to the chart so the crosshair keeps tracking.
+  function forwardCrosshair(e) {
+    if (cv.style.pointerEvents !== "auto") return;   // chart already sees it
+    if (!chart.setCrosshairPosition) return;
+    const m = mousePx(e);
+    const price = candleSeries.coordinateToPrice(m.y);
+    const logical = chart.timeScale().coordinateToLogical(m.x);
+    if (price == null || logical == null) { if (chart.clearCrosshairPosition) chart.clearCrosshairPosition(); return; }
+    const t = logicalToTime(logical);
+    try { chart.setCrosshairPosition(price, t, candleSeries); } catch (_) {}
+  }
+  cv.addEventListener("mousemove", forwardCrosshair);
+  cv.addEventListener("mouseleave", () => { if (chart.clearCrosshairPosition) chart.clearCrosshairPosition(); });
   cv.addEventListener("mousedown", (e) => {
     const m = mousePx(e);
     if (tool === "cursor") {
@@ -1949,6 +2081,10 @@ const drawings = (() => {
   });
   window.addEventListener("keydown", (e) => {
     if (e.target && /^(INPUT|SELECT|TEXTAREA)$/.test(e.target.tagName)) return;
+    // Ctrl+Z / Cmd+Z → undo the last drawing change.
+    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && (e.key === "z" || e.key === "Z")) {
+      undo(); e.preventDefault(); return;
+    }
     if (e.key === "Escape") { draft = null; selected = null; setTool("cursor"); redraw(); notifySel(); }
     if ((e.key === "Delete" || e.key === "Backspace") && selected) {
       const i = items.indexOf(selected); if (i >= 0) items.splice(i, 1);
@@ -1959,33 +2095,71 @@ const drawings = (() => {
   // Points are anchored on a logical index (continuous) at runtime, but we
   // persist a stable `time` per point so drawings survive reload / data
   // refresh. On load, time → logical via the current bar array.
+  // NOTE: logicalToTime and timeToLogical MUST be exact inverses so a
+  // save→load round-trip doesn't move a drawing. Two rules make that hold:
+  //   1) Never round `logical` — preserve the fractional (sub-bar) part.
+  //   2) Off-data (before bar 0 / after the last bar) uses ONE consistent
+  //      edge step in BOTH directions (leading step before the data, trailing
+  //      step after it), so extrapolation inverts cleanly.
+  function _leadStep(bars) { return bars.length > 1 ? (bars[1].time - bars[0].time) : 86400; }
+  function _tailStep(bars) { return bars.length > 1 ? (bars[bars.length - 1].time - bars[bars.length - 2].time) : 86400; }
   function logicalToTime(logical) {
     const bars = window.__bars || [];
-    const i = Math.round(logical);
-    if (i >= 0 && i < bars.length) return bars[i].time;
-    // Off-data: extrapolate using bar spacing (assumes uniform sampling).
-    if (bars.length >= 2) {
-      const step = bars[1].time - bars[0].time;
-      return bars[0].time + i * step;
-    }
-    return bars.length ? bars[0].time : i;
+    if (!bars.length) return logical;
+    const n = bars.length;
+    if (logical <= 0) return bars[0].time + logical * _leadStep(bars);
+    if (logical >= n - 1) return bars[n - 1].time + (logical - (n - 1)) * _tailStep(bars);
+    // Interpolate between the two surrounding real bars (keeps sub-bar frac).
+    const a = Math.floor(logical), frac = logical - a;
+    return bars[a].time + frac * (bars[a + 1].time - bars[a].time);
   }
   function timeToLogical(time) {
     const bars = window.__bars || [];
     if (!bars.length) return 0;
-    // exact / nearest match
-    let lo = 0, hi = bars.length - 1;
-    if (time <= bars[0].time) { const step = bars.length > 1 ? bars[1].time - bars[0].time : 1; return (time - bars[0].time) / step; }
-    if (time >= bars[hi].time) { const step = bars.length > 1 ? bars[hi].time - bars[hi - 1].time : 1; return hi + (time - bars[hi].time) / step; }
+    const n = bars.length;
+    if (time <= bars[0].time) return (time - bars[0].time) / _leadStep(bars);
+    if (time >= bars[n - 1].time) return (n - 1) + (time - bars[n - 1].time) / _tailStep(bars);
+    // Binary-search the bracketing bars, then interpolate.
+    let lo = 0, hi = n - 1;
     while (lo <= hi) { const m = (lo + hi) >> 1; if (bars[m].time === time) return m; if (bars[m].time < time) lo = m + 1; else hi = m - 1; }
-    // between hi and lo: interpolate
-    const a = Math.max(0, hi), b = Math.min(bars.length - 1, lo);
+    const a = Math.max(0, hi), b = Math.min(n - 1, lo);
     if (a === b) return a;
-    const frac = (time - bars[a].time) / (bars[b].time - bars[a].time);
-    return a + frac;
+    return a + (time - bars[a].time) / (bars[b].time - bars[a].time);
   }
   function encPt(p) { return { time: logicalToTime(p.logical), price: p.price }; }
   function decPt(p) { return { logical: timeToLogical(p.time), price: p.price }; }
+
+  // Time↔logical against an EXPLICIT bar array (not window.__bars). Used by
+  // reanchor() so we can convert using the OLD bars, then the NEW bars. Mirrors
+  // logicalToTime exactly (no rounding, consistent edge steps).
+  function logicalToTimeIn(bars, logical) {
+    if (!bars || !bars.length) return logical;
+    const n = bars.length;
+    if (logical <= 0) return bars[0].time + logical * _leadStep(bars);
+    if (logical >= n - 1) return bars[n - 1].time + (logical - (n - 1)) * _tailStep(bars);
+    const a = Math.floor(logical), frac = logical - a;
+    return bars[a].time + frac * (bars[a + 1].time - bars[a].time);
+  }
+  // Re-pin every point to the SAME timestamp when the bar array changes on a
+  // same-symbol refetch (e.g. more history prepended → indices shift). We read
+  // each point's time from the previous bars, then map that time onto the new
+  // bars (now already in window.__bars). Points on real bars stay exact; only
+  // the continuous `logical` is corrected for the new offset.
+  function reanchor(prevBars) {
+    if (!prevBars || !prevBars.length) return;
+    const remap = (p) => {
+      if (!p) return p;
+      const t = logicalToTimeIn(prevBars, p.logical);
+      return { logical: timeToLogical(t), price: p.price };
+    };
+    items.forEach((it) => {
+      if (it.a) it.a = remap(it.a);
+      if (it.b) it.b = remap(it.b);
+      if (it.c) it.c = remap(it.c);
+      if (it.pts) it.pts = it.pts.map(remap);
+    });
+    redraw();
+  }
   function serialize() {
     return items.map((it) => {
       const o = { type: it.type };
@@ -2019,11 +2193,45 @@ const drawings = (() => {
     });
   }
   let onSave = null;
-  function saveDrawings() { if (onSave) onSave(serialize()); }
+  // Undo history: a stack of serialized snapshots. history[last] is always the
+  // current committed state; undo() restores the previous snapshot. Bounded so
+  // it never grows unbounded across a long session.
+  const history = [];
+  const HISTORY_MAX = 100;
+  let restoring = false;   // guard so restoreState()'s save doesn't re-push
+  function pushHistory() {
+    if (restoring) return;
+    const snap = JSON.stringify(serialize());
+    if (history.length && history[history.length - 1] === snap) return;   // no-op
+    history.push(snap);
+    if (history.length > HISTORY_MAX) history.shift();
+  }
+  function restoreState(snap) {
+    restoring = true;
+    items.length = 0; draft = null; selected = null; hovered = null;
+    deserialize(JSON.parse(snap)).forEach((it) => items.push(it));
+    redraw(); notifySel();
+    if (onSave) onSave(serialize());   // persist the reverted state
+    restoring = false;
+  }
+  function undo() {
+    if (history.length < 2) {   // nothing before the current state
+      if (history.length === 1) { restoreState(history[0]); }
+      return;
+    }
+    history.pop();                              // drop current state
+    restoreState(history[history.length - 1]);  // restore previous
+  }
+  function saveDrawings() {
+    pushHistory();
+    if (onSave) onSave(serialize());
+  }
   function loadDrawings(arr) {
     items.length = 0; draft = null; selected = null; hovered = null;
     deserialize(arr).forEach((it) => items.push(it));
     redraw(); notifySel();
+    // Seed history with the loaded state (baseline for undo on this symbol).
+    history.length = 0; pushHistory();
   }
   function clearAll() { items.length = 0; draft = null; selected = null; hovered = null; redraw(); saveDrawings(); }
   chart.timeScale().subscribeVisibleLogicalRangeChange(() => redraw());
@@ -2043,7 +2251,7 @@ const drawings = (() => {
     return { left: r.left + Math.min(...xs), right: r.left + Math.max(...xs), top: r.top + Math.min(...ys), bottom: r.top + Math.max(...ys) };
   }
   return {
-    setTool, clearAll, redraw, loadDrawings, saveDrawings,
+    setTool, clearAll, redraw, loadDrawings, saveDrawings, undo,
     getTool: () => tool,
     getSelected: () => selected,
     setSelected: (it) => { selected = it; redraw(); notifySel(); },
@@ -2085,7 +2293,7 @@ const drawings = (() => {
       const hit = pick(clientX - r.left, clientY - r.top);
       if (!hit) { selected = null; hovered = null; redraw(); notifySel(); }
     },
-    encPt, logicalToTime, timeToLogical,
+    encPt, logicalToTime, timeToLogical, reanchor,
     ensureFibCfg,
     // Auto-place a Fib from detected swing pivots. `kind` is "fibonacci"
     // (2 pivots → retracement) or "fibext" (3 pivots → trend-based extension).
