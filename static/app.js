@@ -664,6 +664,8 @@ async function loadData() {
     if (data.error) { setStatus("Error: " + data.error, true); return; }
     lastData = data;
     window.__bars = data.candles;
+    // Volume aligned to bar index (Date Range tool sums this over a span).
+    window.__vol = (data.volume || []).map((p) => (p && typeof p.value === "number" ? p.value : 0));
     priceOverride = null;
     candleSeries.setData(data.candles);
     volumeSeries.setData(data.volume);
@@ -1150,26 +1152,196 @@ const drawings = (() => {
     ctx.fillText(`${isLong ? "Long" : "Short"}  Target ${it.b.price.toFixed(2)}  R:R ${rr.toFixed(2)}`, x0 + 4, profTop - 4);
     ctx.restore();
   }
-  function drawRangeItem(it, emph) {
+  // Sum of volume between two logical indices (inclusive), using __vol.
+  function volumeBetween(la, lb) {
+    const vol = window.__vol || [];
+    if (!vol.length) return 0;
+    let lo = Math.round(Math.min(la, lb)), hi = Math.round(Math.max(la, lb));
+    lo = Math.max(0, lo); hi = Math.min(vol.length - 1, hi);
+    let s = 0;
+    for (let i = lo; i <= hi; i++) s += vol[i] || 0;
+    return s;
+  }
+  // Compact volume formatting: 7.1B, 950M, 12.3K …
+  function fmtVol(v) {
+    const a = Math.abs(v);
+    if (a >= 1e12) return (v / 1e12).toFixed(2) + "T";
+    if (a >= 1e9) return (v / 1e9).toFixed(2) + "B";
+    if (a >= 1e6) return (v / 1e6).toFixed(2) + "M";
+    if (a >= 1e3) return (v / 1e3).toFixed(2) + "K";
+    return String(Math.round(v));
+  }
+  // Calendar days between two anchor times (uses persisted time when live,
+  // else derives from bar spacing at the logical indices).
+  function daysBetween(it) {
+    const ta = anchorTime(it.a), tb = anchorTime(it.b);
+    if (ta == null || tb == null) return null;
+    return Math.abs(Math.round((tb - ta) / 86400));
+  }
+  function anchorTime(pt) {
+    // Prefer the stored epoch time if present; else map logical→time.
+    if (pt && typeof pt.time === "number") return pt.time;
+    return logicalToTime(pt.logical);
+  }
+
+  // TradingView-style Date Range: a fixed-height band spanning the two time
+  // anchors with a horizontal arrow through the middle, dashed vertical
+  // boundary lines, and a centered label showing bars, calendar days, and
+  // summed volume. Price Range / Date & Price Range stay as boxes.
+  function drawDateRangeItem(it, emph) {
+    const A = toXY(it.a), B = toXY(it.b); if (!A || !B) return;
+    const x0 = Math.min(A.x, B.x), x1 = Math.max(A.x, B.x);
+    // Band is centred vertically on the midpoint of the two anchors, fixed height.
+    const cy = (A.y + B.y) / 2;
+    const H = 26;                       // fixed band height (px)
+    const yTop = cy - H / 2, yBot = cy + H / 2;
+    const ac = C.accent;
+    ctx.save();
+    // Dashed vertical boundary lines across the pane.
+    ctx.strokeStyle = hexA(ac, 0.5); ctx.lineWidth = 1; ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.moveTo(x0, 0); ctx.lineTo(x0, cv.clientHeight);
+    ctx.moveTo(x1, 0); ctx.lineTo(x1, cv.clientHeight);
+    ctx.stroke(); ctx.setLineDash([]);
+    // Band fill + border.
+    ctx.fillStyle = hexA(ac, 0.12);
+    ctx.fillRect(x0, yTop, x1 - x0, H);
+    ctx.strokeStyle = ac; ctx.lineWidth = emph ? 2.5 : 1;
+    ctx.strokeRect(x0, yTop, x1 - x0, H);
+    // Horizontal arrow through the middle (points toward the drag direction).
+    const rightward = B.x >= A.x;
+    const ax0 = rightward ? x0 + 3 : x1 - 3;
+    const ax1 = rightward ? x1 - 3 : x0 + 3;
+    ctx.strokeStyle = ac; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(ax0, cy); ctx.lineTo(ax1, cy); ctx.stroke();
+    const ah = 5, dir = rightward ? 1 : -1;
+    ctx.beginPath();
+    ctx.moveTo(ax1, cy); ctx.lineTo(ax1 - dir * ah, cy - ah);
+    ctx.moveTo(ax1, cy); ctx.lineTo(ax1 - dir * ah, cy + ah);
+    ctx.stroke();
+    // Endpoint handle dot on the start side.
+    ctx.fillStyle = "#fff"; ctx.strokeStyle = ac; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(A.x, cy, 3.5, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    // Label box centred below the band: "N bars, Xd" + "Vol …".
+    const la = chart.timeScale().coordinateToLogical(A.x);
+    const lb = chart.timeScale().coordinateToLogical(B.x);
+    const bars = (la != null && lb != null) ? Math.abs(Math.round(lb - la)) : 0;
+    const d = daysBetween(it);
+    const vol = (la != null && lb != null) ? volumeBetween(la, lb) : 0;
+    const line1 = d != null ? `${bars} bars, ${d}d` : `${bars} bars`;
+    const line2 = `Vol ${fmtVol(vol)}`;
+    ctx.font = "11px 'Segoe UI'";
+    const w = Math.max(ctx.measureText(line1).width, ctx.measureText(line2).width) + 16;
+    const lh = 15, boxH = lh * 2 + 6, cx = (x0 + x1) / 2;
+    const bx = cx - w / 2, by = yBot + 8;
+    ctx.fillStyle = "rgba(30,34,45,0.92)";
+    if (ctx.roundRect) { ctx.beginPath(); ctx.roundRect(bx, by, w, boxH, 5); ctx.fill(); }
+    else ctx.fillRect(bx, by, w, boxH);
+    ctx.fillStyle = C.text; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(line1, cx, by + lh / 2 + 3);
+    ctx.fillText(line2, cx, by + lh + lh / 2 + 3);
+    ctx.restore();
+  }
+
+  // Draw a centred multi-line label box; returns nothing. `lines` may carry a
+  // per-line color; falls back to C.text.
+  function drawLabelBox(cx, cy, lines) {
+    ctx.save();
+    ctx.font = "11px 'Segoe UI'";
+    const lh = 15, pad = 6;
+    const w = Math.max(...lines.map((l) => ctx.measureText(l.text).width)) + 16;
+    const boxH = lh * lines.length + pad;
+    const bx = cx - w / 2, by = cy - boxH / 2;
+    ctx.fillStyle = "rgba(30,34,45,0.92)";
+    if (ctx.roundRect) { ctx.beginPath(); ctx.roundRect(bx, by, w, boxH, 5); ctx.fill(); }
+    else ctx.fillRect(bx, by, w, boxH);
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    lines.forEach((l, i) => {
+      ctx.fillStyle = l.color || C.text;
+      ctx.fillText(l.text, cx, by + pad / 2 + lh * i + lh / 2);
+    });
+    ctx.restore();
+  }
+
+  // TradingView-style Price Range: a band spanning the two prices with a
+  // vertical arrow through the middle and a centred label showing the price
+  // change and percentage (green up / red down).
+  function drawPriceRangeItem(it, emph) {
     const A = toXY(it.a), B = toXY(it.b); if (!A || !B) return;
     const x0 = Math.min(A.x, B.x), x1 = Math.max(A.x, B.x);
     const y0 = Math.min(A.y, B.y), y1 = Math.max(A.y, B.y);
+    const up = it.b.price >= it.a.price;
+    const clr = up ? C.green : C.red;
     ctx.save();
-    ctx.fillStyle = "rgba(41,98,255,0.10)"; ctx.strokeStyle = C.accent; ctx.lineWidth = 1;
-    if (emph) { ctx.lineWidth = 3; }
-    const showPrice = it.type !== "daterange", showDate = it.type !== "pricerange";
-    ctx.fillRect(x0, y0, x1 - x0, y1 - y0); ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
-    ctx.fillStyle = C.text; ctx.font = "11px 'Segoe UI'";
-    let label = "";
-    if (showPrice) {
-      const dP = it.b.price - it.a.price, dPct = it.a.price ? (dP / it.a.price) * 100 : 0;
-      label += `${dP >= 0 ? "+" : ""}${dP.toFixed(2)} (${dPct >= 0 ? "+" : ""}${dPct.toFixed(2)}%)  `;
-    }
-    if (showDate) {
-      const la = chart.timeScale().coordinateToLogical(A.x), lb = chart.timeScale().coordinateToLogical(B.x);
-      if (la != null && lb != null) label += `${Math.abs(Math.round(lb - la))} bars`;
-    }
-    ctx.fillText(label, x0 + 4, y0 - 4); ctx.restore();
+    // Dashed horizontal boundary lines across the pane at each price.
+    ctx.strokeStyle = hexA(clr, 0.5); ctx.lineWidth = 1; ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.moveTo(0, A.y); ctx.lineTo(cv.clientWidth, A.y);
+    ctx.moveTo(0, B.y); ctx.lineTo(cv.clientWidth, B.y);
+    ctx.stroke(); ctx.setLineDash([]);
+    // Band fill + border.
+    ctx.fillStyle = hexA(clr, 0.12);
+    ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
+    ctx.strokeStyle = clr; ctx.lineWidth = emph ? 2.5 : 1;
+    ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
+    // Vertical arrow through the middle, pointing toward B's price.
+    const cx = (x0 + x1) / 2;
+    const ay0 = A.y, ay1 = B.y;
+    ctx.strokeStyle = clr; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(cx, ay0); ctx.lineTo(cx, ay1); ctx.stroke();
+    const ah = 5, dir = ay1 >= ay0 ? 1 : -1;
+    ctx.beginPath();
+    ctx.moveTo(cx, ay1); ctx.lineTo(cx - ah, ay1 - dir * ah);
+    ctx.moveTo(cx, ay1); ctx.lineTo(cx + ah, ay1 - dir * ah);
+    ctx.stroke();
+    // Endpoint handle dot at the start price.
+    ctx.fillStyle = "#fff"; ctx.strokeStyle = clr; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(cx, A.y, 3.5, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    // Label with price change and %, centred on the band midpoint.
+    const dP = it.b.price - it.a.price, dPct = it.a.price ? (dP / it.a.price) * 100 : 0;
+    const txt = `${dP >= 0 ? "+" : ""}${dP.toFixed(2)} (${dPct >= 0 ? "+" : ""}${dPct.toFixed(2)}%)`;
+    drawLabelBox(cx, (y0 + y1) / 2, [{ text: txt, color: clr }]);
+    ctx.restore();
+  }
+
+  // TradingView-style Date & Price Range: a full box over both dimensions with
+  // a centred label combining price change/% and bars/days/volume.
+  function drawDatePriceRangeItem(it, emph) {
+    const A = toXY(it.a), B = toXY(it.b); if (!A || !B) return;
+    const x0 = Math.min(A.x, B.x), x1 = Math.max(A.x, B.x);
+    const y0 = Math.min(A.y, B.y), y1 = Math.max(A.y, B.y);
+    const up = it.b.price >= it.a.price;
+    const clr = up ? C.green : C.red;
+    ctx.save();
+    ctx.fillStyle = hexA(clr, 0.12);
+    ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
+    ctx.strokeStyle = clr; ctx.lineWidth = emph ? 2.5 : 1;
+    ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
+    // Diagonal arrow from A to B.
+    ctx.strokeStyle = clr; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(A.x, A.y); ctx.lineTo(B.x, B.y); ctx.stroke();
+    const ang = Math.atan2(B.y - A.y, B.x - A.x), ah = 7;
+    ctx.beginPath();
+    ctx.moveTo(B.x, B.y); ctx.lineTo(B.x - ah * Math.cos(ang - 0.4), B.y - ah * Math.sin(ang - 0.4));
+    ctx.moveTo(B.x, B.y); ctx.lineTo(B.x - ah * Math.cos(ang + 0.4), B.y - ah * Math.sin(ang + 0.4));
+    ctx.stroke();
+    // Label: price change / % on line 1, bars/days/volume on line 2.
+    const dP = it.b.price - it.a.price, dPct = it.a.price ? (dP / it.a.price) * 100 : 0;
+    const la = chart.timeScale().coordinateToLogical(A.x);
+    const lb = chart.timeScale().coordinateToLogical(B.x);
+    const bars = (la != null && lb != null) ? Math.abs(Math.round(lb - la)) : 0;
+    const d = daysBetween(it);
+    const vol = (la != null && lb != null) ? volumeBetween(la, lb) : 0;
+    const l1 = `${dP >= 0 ? "+" : ""}${dP.toFixed(2)} (${dPct >= 0 ? "+" : ""}${dPct.toFixed(2)}%)`;
+    const l2 = `${d != null ? `${bars} bars, ${d}d` : `${bars} bars`}  ·  Vol ${fmtVol(vol)}`;
+    drawLabelBox((x0 + x1) / 2, (y0 + y1) / 2, [{ text: l1, color: clr }, { text: l2 }]);
+    ctx.restore();
+  }
+
+  function drawRangeItem(it, emph) {
+    if (it.type === "daterange") return drawDateRangeItem(it, emph);
+    if (it.type === "pricerange") return drawPriceRangeItem(it, emph);
+    return drawDatePriceRangeItem(it, emph);   // rangebox
   }
   function drawHLineItem(it, emph) {
     const y = priceToY(it.a.price); if (y == null) return;
