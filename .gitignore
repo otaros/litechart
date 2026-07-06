@@ -1,0 +1,20 @@
+# Secrets — never commit real API keys
+.env
+.env.local
+.env.*.local
+
+# Runtime / generated
+alerts.json
+*.pyc
+__pycache__/
+.pytest_cache/
+
+# Local scratch
+_hook.py
+_hook_out.txt
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

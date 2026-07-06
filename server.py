@@ -406,6 +406,39 @@ def fetch_df(symbol: str, timeframe: str) -> pd.DataFrame:
     return df
 
 
+# Company long-name lookup, cached separately (rarely changes, so a long TTL).
+_NAME_CACHE: dict = {}          # symbol -> (fetched_at, name)
+_NAME_TTL = 24 * 3600           # 1 day
+
+
+def fetch_name(symbol: str) -> str:
+    """Best-effort human-readable company name for a ticker (cached).
+
+    Falls back to the bare symbol if Yahoo has no name / the lookup fails, so
+    a slow or failed metadata call never blocks the price payload.
+    """
+    sym = symbol.upper()
+    cached = _NAME_CACHE.get(sym)
+    if cached is not None and (time.time() - cached[0]) < _NAME_TTL:
+        return cached[1]
+    name = ""
+    try:
+        tk = yf.Ticker(sym, session=_YF_SESSION)
+        info = {}
+        try:
+            info = tk.get_info() or {}
+        except Exception:  # noqa: BLE001
+            info = getattr(tk, "info", {}) or {}
+        name = (info.get("longName") or info.get("shortName")
+                or info.get("displayName") or "").strip()
+    except Exception:  # noqa: BLE001
+        name = ""
+    if not name:
+        name = sym
+    _NAME_CACHE[sym] = (time.time(), name)
+    return name
+
+
 def _fetch_df_uncached(symbol: str, timeframe: str) -> pd.DataFrame:
     period, interval = PERIOD_MAP.get(timeframe, ("1y", "1d"))
     last_err = ""
@@ -487,6 +520,7 @@ def build_data(symbol: str, timeframe: str) -> dict:
     ]
     return {
         "symbol": symbol.upper(),
+        "name": fetch_name(symbol),
         "timeframe": timeframe,
         "candles": candles,
         "volume": hist_points(df.index, v, up_mask),
@@ -707,6 +741,274 @@ def compute_indicator(symbol: str, timeframe: str, ind_type: str, params: dict) 
     }
 
 
+# ═══════════════════════════ Alert engine ═════════════════════════════
+# TradingView-style webhook alerts. Each alert watches a symbol/timeframe and a
+# condition built from either raw price or a server-computed indicator plot.
+# On every NEW BAR CLOSE for the alert's timeframe, the condition is evaluated;
+# if it fires, an HTTP POST is sent to the alert's webhook URL with a
+# user-editable JSON message (placeholders like {{ticker}}, {{price}} filled in).
+import json
+import threading
+from datetime import datetime, timezone
+
+try:
+    import requests as _requests
+except Exception:  # noqa: BLE001
+    _requests = None
+
+_ALERTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alerts.json")
+_ALERTS_LOCK = threading.RLock()
+_ALERTS: dict = {}          # id -> alert dict
+_ALERT_LOG: list = []       # recent fire events (most-recent first, capped)
+_ALERT_LOG_MAX = 200
+_alert_seq = 0
+
+# Comparison operators the UI offers.
+ALERT_OPS = {
+    "gt":   ("Greater than",        lambda a, b, pa, pb: a > b),
+    "lt":   ("Less than",           lambda a, b, pa, pb: a < b),
+    "gte":  ("Greater or equal",    lambda a, b, pa, pb: a >= b),
+    "lte":  ("Less or equal",       lambda a, b, pa, pb: a <= b),
+    "cross_up":   ("Crossing up",   lambda a, b, pa, pb: pa is not None and pa <= pb and a > b),
+    "cross_down": ("Crossing down", lambda a, b, pa, pb: pa is not None and pa >= pb and a < b),
+    "cross":      ("Crossing",      lambda a, b, pa, pb: pa is not None and ((pa <= pb and a > b) or (pa >= pb and a < b))),
+}
+
+
+def _load_alerts() -> None:
+    """Load persisted alerts from disk into memory (once, at startup)."""
+    global _ALERTS, _alert_seq
+    try:
+        with open(_ALERTS_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh) or {}
+        _ALERTS = {a["id"]: a for a in data.get("alerts", []) if a.get("id")}
+        _alert_seq = int(data.get("seq", 0))
+    except (OSError, ValueError, KeyError):
+        _ALERTS, _alert_seq = {}, 0
+
+
+def _save_alerts() -> None:
+    """Persist alerts to disk (called under the lock after any mutation)."""
+    try:
+        tmp = _ALERTS_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"seq": _alert_seq, "alerts": list(_ALERTS.values())}, fh, indent=2)
+        os.replace(tmp, _ALERTS_PATH)
+    except OSError:
+        pass
+
+
+def indicator_series(symbol: str, timeframe: str, ind_type: str, params: dict) -> pd.DataFrame:
+    """Compute an indicator and return its plots as a DataFrame aligned to bars.
+
+    Reuses the exact INDICATORS registry so alert evaluation matches the chart.
+    Column names are the plot keys (plot0, plot1, hist, …).
+    """
+    spec = INDICATORS.get(ind_type)
+    if spec is None:
+        raise ValueError(f"Unknown indicator '{ind_type}'")
+    full = {inp["key"]: inp["default"] for inp in spec["inputs"]}
+    full.update({k: v for k, v in (params or {}).items() if v is not None})
+    df = fetch_df(symbol, timeframe)
+    result = spec["compute"](df, full)
+    offset = int(full.get("offset", 0) or 0)
+    out = pd.DataFrame(index=df.index)
+    for key, series in result.items():
+        s = _apply_offset(series, offset) if offset else series
+        out[key] = np.asarray(s, float) if not hasattr(s, "to_numpy") else s.to_numpy(float)
+    return out
+
+
+def _operand_series(symbol: str, timeframe: str, operand: dict) -> np.ndarray:
+    """Resolve one side of a condition to a numeric numpy series over the bars.
+
+    operand kinds:
+      {"kind": "price", "source": "close"}                → OHLC price series
+      {"kind": "value", "value": 123.4}                   → constant (broadcast)
+      {"kind": "indicator", "type": "rsi", "plot": "plot0",
+       "params": {...}}                                    → indicator plot
+    """
+    kind = operand.get("kind")
+    if kind == "value":
+        df = fetch_df(symbol, timeframe)
+        return np.full(len(df), float(operand.get("value", 0.0)))
+    if kind == "price":
+        df = fetch_df(symbol, timeframe)
+        src = (operand.get("source") or "close").capitalize()
+        col = {"Open": "Open", "High": "High", "Low": "Low", "Close": "Close",
+               "Hl2": None, "Hlc3": None, "Ohlc4": None}.get(src, "Close")
+        if col is None:  # derived sources
+            if src == "Hl2":
+                return ((df["High"] + df["Low"]) / 2).to_numpy(float)
+            if src == "Hlc3":
+                return ((df["High"] + df["Low"] + df["Close"]) / 3).to_numpy(float)
+            return ((df["Open"] + df["High"] + df["Low"] + df["Close"]) / 4).to_numpy(float)
+        return df[col].to_numpy(float)
+    if kind == "indicator":
+        frame = indicator_series(symbol, timeframe, operand.get("type"), operand.get("params") or {})
+        plot = operand.get("plot") or "plot0"
+        if plot not in frame.columns:
+            plot = frame.columns[0] if len(frame.columns) else None
+        if plot is None:
+            raise ValueError("Indicator produced no plots")
+        return frame[plot].to_numpy(float)
+    raise ValueError(f"Unknown operand kind '{kind}'")
+
+
+def evaluate_alert(alert: dict) -> dict:
+    """Evaluate an alert's condition on the LAST CLOSED bar.
+
+    Returns {"fires": bool, "bar_time": epoch, "left": v, "right": v}.
+    Uses the last two bars so crossing conditions have a previous value.
+    """
+    symbol = alert["symbol"]
+    tf = alert["timeframe"]
+    cond = alert["condition"]
+    left = _operand_series(symbol, tf, cond["left"])
+    right = _operand_series(symbol, tf, cond["right"])
+    df = fetch_df(symbol, tf)
+    ts = _epoch(df.index)
+    n = min(len(left), len(right))
+    if n == 0:
+        return {"fires": False}
+    a, b = left[n - 1], right[n - 1]
+    pa = left[n - 2] if n >= 2 else None
+    pb = right[n - 2] if n >= 2 else None
+    if a != a or b != b:  # NaN guard
+        return {"fires": False, "bar_time": int(ts[n - 1])}
+    if pa is not None and (pa != pa or pb != pb):
+        pa = pb = None
+    op = ALERT_OPS.get(cond.get("op", "gt"))
+    fires = bool(op[1](a, b, pa, pb)) if op else False
+    return {"fires": fires, "bar_time": int(ts[n - 1]), "left": float(a), "right": float(b)}
+
+
+def _fill_placeholders(msg: str, ctx: dict) -> str:
+    out = msg or ""
+    for k, v in ctx.items():
+        out = out.replace("{{" + k + "}}", str(v))
+    return out
+
+
+def _send_webhook(alert: dict, ctx: dict) -> dict:
+    """POST the alert message to its webhook. Returns a small status dict."""
+    url = alert.get("webhook") or ""
+    raw = _fill_placeholders(alert.get("message") or "", ctx)
+    # Try to send JSON if the message parses as JSON, else send text.
+    headers = {"Content-Type": "application/json"}
+    payload_is_json = True
+    try:
+        body = json.loads(raw)
+    except (ValueError, TypeError):
+        payload_is_json = False
+        body = raw
+    if not url:
+        return {"ok": False, "error": "no webhook url"}
+    if _requests is None:
+        return {"ok": False, "error": "requests not installed"}
+    try:
+        if payload_is_json:
+            r = _requests.post(url, json=body, timeout=10, verify=False)
+        else:
+            r = _requests.post(url, data=body.encode("utf-8"),
+                               headers={"Content-Type": "text/plain"}, timeout=10, verify=False)
+        return {"ok": r.status_code < 400, "status": r.status_code}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": str(e)}
+
+
+def _log_fire(alert: dict, ev: dict, sent: dict) -> None:
+    entry = {
+        "alert_id": alert["id"],
+        "name": alert.get("name") or alert["symbol"],
+        "symbol": alert["symbol"],
+        "timeframe": alert["timeframe"],
+        "time": datetime.now(timezone.utc).isoformat(),
+        "bar_time": ev.get("bar_time"),
+        "left": ev.get("left"),
+        "right": ev.get("right"),
+        "webhook": sent,
+    }
+    _ALERT_LOG.insert(0, entry)
+    del _ALERT_LOG[_ALERT_LOG_MAX:]
+
+
+def fire_alert(alert: dict, ev: dict) -> dict:
+    """Build context, send webhook, log, and update alert bookkeeping."""
+    op_label = ALERT_OPS.get(alert["condition"].get("op", "gt"), ("", None))[0]
+    ctx = {
+        "ticker": alert["symbol"],
+        "symbol": alert["symbol"],
+        "timeframe": alert["timeframe"],
+        "name": alert.get("name") or alert["symbol"],
+        "price": round(ev.get("left", 0.0), 4),
+        "value": round(ev.get("left", 0.0), 4),
+        "threshold": round(ev.get("right", 0.0), 4),
+        "op": op_label,
+        "time": datetime.now(timezone.utc).isoformat(),
+        "bar_time": ev.get("bar_time"),
+    }
+    sent = _send_webhook(alert, ctx)
+    _log_fire(alert, ev, sent)
+    return sent
+
+
+def _tf_seconds(tf: str) -> int:
+    """Approx seconds per bar — controls how often a timeframe is checked."""
+    return {
+        "1m": 60, "2m": 120, "5m": 300, "15m": 900, "30m": 1800,
+        "1h": 3600, "60m": 3600, "90m": 5400, "4h": 14400,
+        "1D": 86400, "1W": 604800, "1M": 2592000,
+    }.get(tf, 86400)
+
+
+def _alert_worker() -> None:
+    """Background loop: evaluate active alerts when their bar likely closed.
+
+    Per-alert we track the last evaluated bar time so we only fire ONCE per new
+    closed bar (TradingView 'Once per bar close' semantics). Fired one-shot
+    alerts are disabled after firing; 'recurring' alerts stay active.
+    """
+    last_check: dict = {}
+    while True:
+        try:
+            now = time.time()
+            with _ALERTS_LOCK:
+                active = [dict(a) for a in _ALERTS.values() if a.get("enabled")]
+            for alert in active:
+                aid = alert["id"]
+                interval = max(20, _tf_seconds(alert["timeframe"]) // 12)
+                if now - last_check.get(aid, 0) < interval:
+                    continue
+                last_check[aid] = now
+                try:
+                    ev = evaluate_alert(alert)
+                except Exception:  # noqa: BLE001
+                    continue
+                bar_time = ev.get("bar_time")
+                # Only act on a bar we haven't processed for this alert yet.
+                with _ALERTS_LOCK:
+                    live = _ALERTS.get(aid)
+                    if not live or not live.get("enabled"):
+                        continue
+                    if bar_time is not None and live.get("last_bar") == bar_time:
+                        continue
+                    live["last_bar"] = bar_time
+                    if ev.get("fires"):
+                        live["last_fired"] = datetime.now(timezone.utc).isoformat()
+                        if live.get("mode", "once") == "once":
+                            live["enabled"] = False
+                        fire_target = dict(live)
+                    else:
+                        fire_target = None
+                    _save_alerts()
+                if fire_target:
+                    fire_alert(fire_target, ev)
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(5)
+
+
 # ─────────────────────────── Flask app ────────────────────────────────
 app = Flask(__name__)
 # Re-read templates from disk on each request so edits show up without a restart.
@@ -923,6 +1225,145 @@ def api_indicator():
             pass  # leave strings (e.g. source)
     try:
         return jsonify(compute_indicator(symbol, timeframe, ind_type, params))
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": str(e)}), 502
+
+
+# ─────────────────────────── Alert API ────────────────────────────────
+def _valid_alert(body: dict) -> tuple:
+    """Return (ok, error) after light validation of an alert payload."""
+    if not isinstance(body, dict):
+        return False, "invalid body"
+    if not (body.get("symbol") or "").strip():
+        return False, "symbol is required"
+    if not (body.get("webhook") or "").strip():
+        return False, "webhook URL is required"
+    cond = body.get("condition") or {}
+    if cond.get("op") not in ALERT_OPS:
+        return False, "invalid operator"
+    if not isinstance(cond.get("left"), dict) or not isinstance(cond.get("right"), dict):
+        return False, "condition operands are required"
+    return True, ""
+
+
+def _alert_meta():
+    """Descriptor the UI uses to build the alert dialog: operators, price
+    sources, and every indicator with its selectable plots."""
+    inds = []
+    for key, spec in INDICATORS.items():
+        inds.append({
+            "type": key, "name": spec["name"],
+            "inputs": spec["inputs"], "plots": spec["plots"],
+        })
+    return {
+        "ops": [{"id": k, "label": v[0]} for k, v in ALERT_OPS.items()],
+        "sources": ["close", "open", "high", "low", "hl2", "hlc3", "ohlc4"],
+        "indicators": inds,
+        "placeholders": ["ticker", "symbol", "name", "timeframe",
+                         "price", "value", "threshold", "op", "time", "bar_time"],
+    }
+
+
+@app.route("/api/alerts/meta")
+def api_alerts_meta():
+    return jsonify(_alert_meta())
+
+
+@app.route("/api/alerts", methods=["GET"])
+def api_alerts_list():
+    with _ALERTS_LOCK:
+        alerts = list(_ALERTS.values())
+    return jsonify({"alerts": alerts, "log": _ALERT_LOG[:50]})
+
+
+@app.route("/api/alerts", methods=["POST"])
+def api_alerts_create():
+    global _alert_seq
+    body = request.get_json(silent=True) or {}
+    ok, err = _valid_alert(body)
+    if not ok:
+        return jsonify({"error": err}), 400
+    with _ALERTS_LOCK:
+        _alert_seq += 1
+        aid = f"al{_alert_seq}"
+        alert = {
+            "id": aid,
+            "name": (body.get("name") or "").strip(),
+            "symbol": body["symbol"].strip().upper(),
+            "timeframe": body.get("timeframe") or "1D",
+            "condition": body["condition"],
+            "webhook": body["webhook"].strip(),
+            "message": body.get("message") or "",
+            "mode": body.get("mode") or "once",   # 'once' | 'recurring'
+            "enabled": True,
+            "created": datetime.now(timezone.utc).isoformat(),
+            "last_bar": None,
+            "last_fired": None,
+        }
+        _ALERTS[aid] = alert
+        _save_alerts()
+    return jsonify(alert)
+
+
+@app.route("/api/alerts/<aid>", methods=["PATCH"])
+def api_alerts_update(aid):
+    body = request.get_json(silent=True) or {}
+    with _ALERTS_LOCK:
+        alert = _ALERTS.get(aid)
+        if not alert:
+            return jsonify({"error": "not found"}), 404
+        for field in ("name", "symbol", "timeframe", "condition",
+                      "webhook", "message", "mode", "enabled"):
+            if field in body:
+                alert[field] = body[field]
+        if "symbol" in body:
+            alert["symbol"] = (alert["symbol"] or "").strip().upper()
+        # Re-arm when re-enabled so it can fire on the next new bar.
+        if body.get("enabled"):
+            alert["last_bar"] = None
+        _save_alerts()
+    return jsonify(alert)
+
+
+@app.route("/api/alerts/<aid>", methods=["DELETE"])
+def api_alerts_delete(aid):
+    with _ALERTS_LOCK:
+        existed = _ALERTS.pop(aid, None) is not None
+        if existed:
+            _save_alerts()
+    return jsonify({"ok": existed})
+
+
+@app.route("/api/alerts/<aid>/test", methods=["POST"])
+def api_alerts_test(aid):
+    """Fire the webhook immediately with current values (does not change state)."""
+    with _ALERTS_LOCK:
+        alert = _ALERTS.get(aid)
+        if not alert:
+            return jsonify({"error": "not found"}), 404
+        snapshot = dict(alert)
+    try:
+        ev = evaluate_alert(snapshot)
+    except Exception as e:  # noqa: BLE001
+        ev = {"fires": False, "error": str(e)}
+    sent = fire_alert(snapshot, ev)
+    return jsonify({"sent": sent, "eval": ev})
+
+
+@app.route("/api/alerts/preview", methods=["POST"])
+def api_alerts_preview():
+    """Evaluate an unsaved condition against current data (for the dialog)."""
+    body = request.get_json(silent=True) or {}
+    ok, err = _valid_alert({**body, "webhook": body.get("webhook") or "x"})
+    if not ok:
+        return jsonify({"error": err}), 400
+    try:
+        ev = evaluate_alert({
+            "symbol": body["symbol"].strip().upper(),
+            "timeframe": body.get("timeframe") or "1D",
+            "condition": body["condition"],
+        })
+        return jsonify(ev)
     except Exception as e:  # noqa: BLE001
         return jsonify({"error": str(e)}), 502
 
@@ -1195,7 +1636,16 @@ if __name__ == "__main__":
         if os.environ.get("OPEN_BROWSER", "").strip() in ("1", "true", "yes"):
             Timer(1.2, lambda: webbrowser.open(url)).start()
         print(f"LiteChart running at {url}  (auto-reload on edits)")
+    else:
+        # Only the worker actually serves requests, so run the alert scheduler
+        # here (running it in the parent too would double-fire webhooks).
+        _load_alerts()
+        threading.Thread(target=_alert_worker, daemon=True).start()
 
     # debug=True enables Werkzeug's reloader: editing server.py restarts the
     # app in place on the SAME port — no manual restart, no new port.
-    app.run(host="127.0.0.1", port=port, debug=True, use_reloader=True, threaded=True)
+    # Exclude site-packages and local scratch files so they don't trigger a
+    # reload storm that can wedge the server.
+    app.run(host="127.0.0.1", port=port, debug=True, use_reloader=True,
+            exclude_patterns=["*/site-packages/*", "*_t.py", "*_hook*"],
+            threaded=True)

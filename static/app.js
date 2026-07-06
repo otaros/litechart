@@ -557,8 +557,11 @@ function renderPriceLegend(bar, volVal, prevClose, crosshairVals) {
     const chg = prevClose ? bar.close - prevClose : 0;
     const pct = prevClose ? (chg / prevClose) * 100 : 0;
     const sign = chg >= 0 ? "+" : "";
+    const fullName = lastData.name && lastData.name !== lastData.symbol
+      ? `<span class="lg-name">${lastData.name}</span>` : "";
     html += `<div class="lg-row">` +
       `<b style="color:${C.text};font-size:13px">${lastData.symbol}</b>` +
+      fullName +
       `<span class="k">${lastData.timeframe}</span>` +
       `<span style="color:${col};margin-left:8px">O<b> ${bar.open.toFixed(2)}</b>  H<b> ${bar.high.toFixed(2)}</b>  ` +
       `L<b> ${bar.low.toFixed(2)}</b>  C<b> ${bar.close.toFixed(2)}</b>  <b>${sign}${chg.toFixed(2)} (${sign}${pct.toFixed(2)}%)</b></span>` +
@@ -3200,6 +3203,295 @@ document.addEventListener("mousedown", (e) => {
 });
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeWlMenu(); });
 window.addEventListener("resize", () => { if (wlMenu.classList.contains("open")) positionWlMenu(); });
+
+// ═══════════════════════════ Alerts UI ════════════════════════════════
+const Alerts = (() => {
+  const panel = document.getElementById("alerts-panel");
+  const dlg = document.getElementById("alert-dlg");
+  let meta = null;            // { ops, sources, indicators, placeholders }
+  let editingId = null;       // null = creating, else editing this alert id
+
+  const DEFAULT_MSG =
+    '{\n  "ticker": "{{ticker}}",\n  "price": {{price}},\n  "time": "{{time}}",\n  "message": "{{name}} {{op}} {{threshold}}"\n}';
+
+  async function loadMeta() {
+    if (meta) return meta;
+    meta = await (await fetch("/api/alerts/meta")).json();
+    return meta;
+  }
+
+  // ── Panel (list + log) ──
+  async function refreshList() {
+    const data = await (await fetch("/api/alerts")).json();
+    renderList(data.alerts || []);
+    renderLog(data.log || []);
+  }
+
+  function opLabel(id) {
+    const o = (meta && meta.ops || []).find((x) => x.id === id);
+    return o ? o.label : id;
+  }
+
+  function operandText(op) {
+    if (!op) return "?";
+    if (op.kind === "value") return String(op.value);
+    if (op.kind === "price") return (op.source || "close");
+    if (op.kind === "indicator") {
+      const nm = (meta && meta.indicators || []).find((i) => i.type === op.type);
+      return (nm ? nm.name : op.type) + (op.plot && op.plot !== "plot0" ? ` (${op.plot})` : "");
+    }
+    return "?";
+  }
+
+  function describe(a) {
+    const c = a.condition || {};
+    return `${operandText(c.left)} ${opLabel(c.op)} ${operandText(c.right)}`;
+  }
+
+  function renderList(alerts) {
+    const box = document.getElementById("ap-list");
+    if (!alerts.length) { box.innerHTML = `<div class="ap-empty">No alerts yet. Click “+ New alert”.</div>`; return; }
+    box.innerHTML = alerts.map((a) => {
+      const badge = a.enabled ? `<span class="al-badge on">Active</span>` : `<span class="al-badge paused">Paused</span>`;
+      const fired = a.last_fired ? `Last fired: ${new Date(a.last_fired).toLocaleString()}` : "Never fired";
+      return `<div class="al-card ${a.enabled ? "" : "off"}" data-id="${a.id}">
+        <div class="al-card-top">
+          <div><span class="al-sym">${a.symbol}</span><span class="al-tf">${a.timeframe}</span></div>
+          ${badge}
+        </div>
+        <div class="al-desc">${a.name ? `<b>${a.name}</b> · ` : ""}${describe(a)}</div>
+        <div class="al-meta">${a.mode === "once" ? "Once" : "Recurring"} · ${fired}</div>
+        <div class="al-actions">
+          <button class="al-toggle">${a.enabled ? "Pause" : "Resume"}</button>
+          <button class="al-test">Test</button>
+          <button class="al-edit">Edit</button>
+          <button class="al-del">Delete</button>
+        </div>
+      </div>`;
+    }).join("");
+    box.querySelectorAll(".al-card").forEach((card) => {
+      const id = card.dataset.id;
+      const a = alerts.find((x) => x.id === id);
+      card.querySelector(".al-toggle").onclick = async () => {
+        await fetch(`/api/alerts/${id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled: !a.enabled }) });
+        refreshList();
+      };
+      card.querySelector(".al-test").onclick = async () => {
+        const r = await (await fetch(`/api/alerts/${id}/test`, { method: "POST" })).json();
+        setStatus(r.sent && r.sent.ok ? `Test sent (HTTP ${r.sent.status})` : `Test failed: ${r.sent && (r.sent.error || r.sent.status)}`, !(r.sent && r.sent.ok));
+        refreshList();
+      };
+      card.querySelector(".al-edit").onclick = () => openDialog(a);
+      card.querySelector(".al-del").onclick = async () => {
+        await fetch(`/api/alerts/${id}`, { method: "DELETE" });
+        refreshList();
+      };
+    });
+  }
+
+  function renderLog(log) {
+    const box = document.getElementById("ap-log");
+    if (!log.length) { box.innerHTML = `<div class="ap-empty">No alerts have fired yet.</div>`; return; }
+    box.innerHTML = log.map((e) => {
+      const ok = e.webhook && e.webhook.ok;
+      const st = ok ? `<span class="lok">delivered${e.webhook.status ? ` (${e.webhook.status})` : ""}</span>` : `<span class="lerr">failed: ${(e.webhook && (e.webhook.error || e.webhook.status)) || "?"}</span>`;
+      return `<div class="al-log-item">
+        <b>${e.symbol}</b> <span class="al-tf">${e.timeframe}</span> — ${st}
+        <div class="lt">${new Date(e.time).toLocaleString()} · left ${e.left != null ? (+e.left).toFixed(2) : "?"} / right ${e.right != null ? (+e.right).toFixed(2) : "?"}</div>
+      </div>`;
+    }).join("");
+  }
+
+  // ── Dialog: build operand controls from meta ──
+  function fillSelect(sel, items, fmt) {
+    sel.innerHTML = items.map((it) => {
+      const v = fmt ? fmt(it) : { value: it, label: it };
+      return `<option value="${v.value}">${v.label}</option>`;
+    }).join("");
+  }
+
+  function buildParamsForm(container, indType, existing) {
+    container.innerHTML = "";
+    if (!indType) return;
+    const spec = (meta.indicators || []).find((i) => i.type === indType);
+    if (!spec) return;
+    (spec.inputs || []).forEach((inp) => {
+      if (inp.type !== "int" && inp.type !== "float") return;   // keep it simple: numeric inputs only
+      const val = existing && existing[inp.key] != null ? existing[inp.key] : inp.default;
+      const row = document.createElement("div");
+      row.className = "dlg-field";
+      row.innerHTML = `<label>${inp.label}</label><input type="number" step="any" data-pk="${inp.key}" value="${val}" />`;
+      container.appendChild(row);
+    });
+  }
+
+  function plotsFor(indType) {
+    const spec = (meta.indicators || []).find((i) => i.type === indType);
+    return spec ? spec.plots : ["plot0"];
+  }
+
+  function wireSide(side, operand) {
+    const kindSel = document.getElementById(`al-${side}-kind`);
+    const srcSel = document.getElementById(`al-${side}-source`);
+    const indSel = document.getElementById(`al-${side}-ind`);
+    const plotSel = document.getElementById(`al-${side}-plot`);
+    const paramsBox = document.getElementById(`al-${side}-params`);
+    fillSelect(srcSel, meta.sources);
+    fillSelect(indSel, meta.indicators, (i) => ({ value: i.type, label: i.name }));
+
+    const sync = () => {
+      const kind = kindSel.value;
+      document.querySelectorAll(`.al-${side}-price`).forEach((el) => el.style.display = kind === "price" ? "" : "none");
+      document.querySelectorAll(`.al-${side}-ind`).forEach((el) => el.style.display = kind === "indicator" ? "" : "none");
+      const valRow = document.querySelector(`.al-${side}-value`);
+      if (valRow) valRow.style.display = kind === "value" ? "" : "none";
+      paramsBox.style.display = kind === "indicator" ? "" : "none";
+      if (kind === "indicator") { fillSelect(plotSel, plotsFor(indSel.value)); buildParamsForm(paramsBox, indSel.value); }
+    };
+    kindSel.onchange = sync;
+    indSel.onchange = () => { fillSelect(plotSel, plotsFor(indSel.value)); buildParamsForm(paramsBox, indSel.value); };
+
+    // Preset from an existing operand.
+    if (operand) {
+      kindSel.value = operand.kind;
+      if (operand.kind === "price") srcSel.value = operand.source || "close";
+      if (operand.kind === "value") { const v = document.getElementById(`al-${side}-value`); if (v) v.value = operand.value; }
+      if (operand.kind === "indicator") {
+        indSel.value = operand.type; sync(); fillSelect(plotSel, plotsFor(operand.type));
+        plotSel.value = operand.plot || "plot0"; buildParamsForm(paramsBox, operand.type, operand.params);
+        return;
+      }
+    }
+    sync();
+  }
+
+  function readSide(side) {
+    const kind = document.getElementById(`al-${side}-kind`).value;
+    if (kind === "value") return { kind: "value", value: parseFloat(document.getElementById(`al-${side}-value`).value) || 0 };
+    if (kind === "price") return { kind: "price", source: document.getElementById(`al-${side}-source`).value };
+    const type = document.getElementById(`al-${side}-ind`).value;
+    const plot = document.getElementById(`al-${side}-plot`).value;
+    const params = {};
+    document.getElementById(`al-${side}-params`).querySelectorAll("[data-pk]").forEach((inp) => {
+      params[inp.dataset.pk] = parseFloat(inp.value);
+    });
+    return { kind: "indicator", type, plot, params };
+  }
+
+  async function openDialog(existing) {
+    await loadMeta();
+    editingId = existing ? existing.id : null;
+    document.getElementById("alert-dlg-title").textContent = existing ? "Edit Alert" : "Create Alert";
+    document.getElementById("al-save").textContent = existing ? "Save" : "Create";
+    fillSelect(document.getElementById("al-op"), meta.ops, (o) => ({ value: o.id, label: o.label }));
+
+    document.getElementById("al-symbol").value = existing ? existing.symbol : currentSymbol;
+    document.getElementById("al-tf").value = existing ? existing.timeframe : currentTf;
+    document.getElementById("al-webhook").value = existing ? existing.webhook : "";
+    document.getElementById("al-message").value = existing ? existing.message : DEFAULT_MSG;
+    document.getElementById("al-mode").value = existing ? existing.mode : "once";
+    if (existing) document.getElementById("al-op").value = existing.condition.op;
+
+    wireSide("left", existing ? existing.condition.left : { kind: "price", source: "close" });
+    wireSide("right", existing ? existing.condition.right : { kind: "value", value: 0 });
+
+    // Clickable placeholder chips.
+    document.getElementById("al-placeholders").innerHTML =
+      "Placeholders: " + meta.placeholders.map((p) => `<code data-ph="{{${p}}}">{{${p}}}</code>`).join(" ");
+    document.getElementById("al-placeholders").querySelectorAll("code").forEach((c) => {
+      c.onclick = () => {
+        const ta = document.getElementById("al-message");
+        const s = ta.selectionStart || ta.value.length;
+        ta.value = ta.value.slice(0, s) + c.dataset.ph + ta.value.slice(ta.selectionEnd || s);
+        ta.focus();
+      };
+    });
+    document.getElementById("al-preview").textContent = "";
+    dlg.classList.add("open");
+  }
+
+  function closeDialog() { dlg.classList.remove("open"); editingId = null; }
+
+  function collect() {
+    return {
+      name: "",
+      symbol: (document.getElementById("al-symbol").value || "").trim().toUpperCase(),
+      timeframe: document.getElementById("al-tf").value,
+      condition: { op: document.getElementById("al-op").value, left: readSide("left"), right: readSide("right") },
+      webhook: document.getElementById("al-webhook").value.trim(),
+      message: document.getElementById("al-message").value,
+      mode: document.getElementById("al-mode").value,
+    };
+  }
+
+  async function save() {
+    const body = collect();
+    if (!body.symbol) { setStatus("Alert: symbol required", true); return; }
+    if (!body.webhook) { setStatus("Alert: webhook URL required", true); return; }
+    const url = editingId ? `/api/alerts/${editingId}` : "/api/alerts";
+    const method = editingId ? "PATCH" : "POST";
+    const r = await fetch(url, { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    if (!r.ok) { const e = await r.json().catch(() => ({})); setStatus("Alert save failed: " + (e.error || r.status), true); return; }
+    closeDialog(); refreshList();
+    setStatus(editingId ? "Alert updated" : "Alert created");
+  }
+
+  async function preview() {
+    const body = collect();
+    const box = document.getElementById("al-preview");
+    try {
+      const r = await (await fetch("/api/alerts/preview", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })).json();
+      if (r.error) { box.className = "al-preview err"; box.textContent = "Preview: " + r.error; return; }
+      box.className = "al-preview " + (r.fires ? "fires" : "nofire");
+      box.textContent = `Now: left ${r.left != null ? r.left.toFixed(2) : "?"} vs right ${r.right != null ? r.right.toFixed(2) : "?"} → ${r.fires ? "WOULD FIRE" : "would not fire"} on last closed bar`;
+    } catch (e) { box.className = "al-preview err"; box.textContent = "Preview error"; }
+  }
+
+  async function testFromDialog() {
+    // Save first if new, then hit the test endpoint so users can verify wiring.
+    const body = collect();
+    if (!body.webhook) { setStatus("Alert: webhook URL required to test", true); return; }
+    await preview();
+    // Fire a one-off test without persisting when creating: reuse preview eval + manual send via a temp create/delete is overkill;
+    // simplest: if editing, use its test route; if new, create then test then leave it (user asked to test).
+    if (editingId) {
+      const r = await (await fetch(`/api/alerts/${editingId}/test`, { method: "POST" })).json();
+      setStatus(r.sent && r.sent.ok ? `Test sent (HTTP ${r.sent.status})` : `Test failed: ${r.sent && (r.sent.error || r.sent.status)}`, !(r.sent && r.sent.ok));
+    } else {
+      setStatus("Save the alert first, then use Test from the list.", true);
+    }
+  }
+
+  // ── Panel open/close + tabs ──
+  function openPanel() { panel.classList.add("open"); refreshList(); }
+  function closePanel() { panel.classList.remove("open"); }
+
+  document.getElementById("alert-toggle").addEventListener("click", () => {
+    if (panel.classList.contains("open")) closePanel(); else openPanel();
+  });
+  document.getElementById("alerts-close").addEventListener("click", closePanel);
+  document.getElementById("alert-new").addEventListener("click", () => openDialog(null));
+  panel.querySelectorAll(".ap-tab").forEach((tab) => {
+    tab.onclick = () => {
+      panel.querySelectorAll(".ap-tab").forEach((t) => t.classList.toggle("active", t === tab));
+      document.getElementById("ap-list").style.display = tab.dataset.atab === "list" ? "" : "none";
+      document.getElementById("ap-log").style.display = tab.dataset.atab === "log" ? "" : "none";
+    };
+  });
+
+  document.getElementById("alert-dlg-close").addEventListener("click", closeDialog);
+  document.getElementById("al-cancel").addEventListener("click", closeDialog);
+  dlg.querySelector(".dlg-backdrop").addEventListener("click", closeDialog);
+  document.getElementById("al-save").addEventListener("click", save);
+  document.getElementById("al-test").addEventListener("click", testFromDialog);
+  document.getElementById("al-webhook").addEventListener("blur", preview);
+  ["al-op", "al-left-kind", "al-right-kind"].forEach((id) => document.getElementById(id).addEventListener("change", preview));
+
+  // Poll the log periodically while the panel is open so fired alerts show up.
+  setInterval(() => { if (panel.classList.contains("open")) refreshList(); }, 15000);
+
+  return { openPanel };
+})();
 
 async function init() {
   try {

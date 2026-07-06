@@ -169,6 +169,7 @@
   /* Legend rows with per-indicator controls */
   .lg-row { display: flex; align-items: center; gap: 2px; }
   .lg-row .k { color: var(--text2); margin-left: 4px; }
+  .lg-name { color: var(--text2); font-size: 12px; margin-left: 6px; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .lg-osc { position: absolute; left: 0; white-space: nowrap; }
   .ind-row .lg-btns { display: none; margin-left: 6px; pointer-events: auto; }
   .ind-row:hover .lg-btns { display: inline-flex; gap: 1px; }
@@ -224,6 +225,62 @@
   .coord-row .coord-label { color: var(--text2); font-size: 13px; width: 90px; }
   .coord-row input { flex: 1; height: 30px; background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 5px; padding: 0 8px; font-size: 13px; }
   .coord-row input:focus { outline: none; border-color: var(--accent); }
+
+  /* ── Alerts side panel ── */
+  #alerts-panel {
+    position: fixed; top: 42px; right: 0; bottom: 0; width: 340px; z-index: 45;
+    background: var(--panel); border-left: 1px solid var(--border);
+    display: none; flex-direction: column; box-shadow: -8px 0 30px rgba(0,0,0,0.4);
+  }
+  #alerts-panel.open { display: flex; }
+  .ap-head { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; }
+  .ap-head b { font-size: 15px; }
+  .ap-head-btns { display: flex; align-items: center; gap: 8px; }
+  .ap-new { background: var(--accent); color: #fff; border: none; border-radius: 5px; padding: 6px 10px; cursor: pointer; font-size: 12px; font-weight: 600; }
+  .ap-new:hover { opacity: .9; }
+  #alerts-close { background: transparent; border: none; color: var(--text2); cursor: pointer; font-size: 20px; line-height: 1; }
+  #alerts-close:hover { color: var(--text); }
+  .ap-tabs { display: flex; gap: 18px; padding: 0 14px; border-bottom: 1px solid var(--border); }
+  .ap-tab { background: transparent; border: none; color: var(--text2); cursor: pointer; font-size: 13px; font-weight: 600; padding: 8px 0; border-bottom: 2px solid transparent; }
+  .ap-tab.active { color: var(--text); border-bottom-color: var(--accent); }
+  .ap-body { flex: 1; overflow-y: auto; padding: 10px; }
+  .al-card { background: var(--panel2); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; }
+  .al-card.off { opacity: .55; }
+  .al-card-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .al-card .al-sym { font-weight: 700; font-size: 14px; }
+  .al-card .al-tf { color: var(--text2); font-size: 11px; margin-left: 6px; }
+  .al-card .al-desc { color: var(--text); font-size: 12px; margin-top: 5px; word-break: break-word; }
+  .al-card .al-meta { color: var(--text2); font-size: 11px; margin-top: 4px; }
+  .al-card .al-actions { display: flex; gap: 6px; margin-top: 8px; }
+  .al-card .al-actions button { flex: 1; height: 26px; border-radius: 5px; border: 1px solid var(--border); background: var(--panel); color: var(--text); cursor: pointer; font-size: 11px; }
+  .al-card .al-actions button:hover { border-color: var(--accent); }
+  .al-card .al-actions .al-del:hover { border-color: var(--red); color: var(--red); }
+  .al-badge { font-size: 10px; padding: 2px 7px; border-radius: 10px; font-weight: 600; }
+  .al-badge.on { background: rgba(38,166,154,0.2); color: var(--green); }
+  .al-badge.paused { background: rgba(120,123,134,0.2); color: var(--text2); }
+  .ap-empty { color: var(--text2); font-size: 12px; text-align: center; padding: 20px; }
+  .al-log-item { border-bottom: 1px solid var(--border); padding: 8px 4px; font-size: 12px; }
+  .al-log-item .lt { color: var(--text2); font-size: 10px; }
+  .al-log-item .lok { color: var(--green); }
+  .al-log-item .lerr { color: var(--red); }
+
+  /* ── Alert dialog ── */
+  #alert-dlg { position: fixed; inset: 0; z-index: 70; display: none; }
+  #alert-dlg.open { display: block; }
+  #alert-dlg .dlg-backdrop { position: absolute; inset: 0; background: rgba(0,0,0,0.45); }
+  #alert-dlg .dlg-box { width: 380px; max-height: 86vh; left: 50%; top: 50%; transform: translate(-50%, -50%); }
+  #alert-dlg .dlg-field input, #alert-dlg .dlg-field select { width: 200px; }
+  .al-msg-wrap { margin-top: 4px; }
+  .al-msg-wrap label { color: var(--text2); font-size: 12px; display: block; margin-bottom: 5px; }
+  #al-message { width: 100%; background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 5px; padding: 8px; font-size: 12px; font-family: ui-monospace, "Cascadia Code", Consolas, monospace; resize: vertical; }
+  #al-message:focus { outline: none; border-color: var(--accent); }
+  .al-hint { color: var(--text2); font-size: 11px; margin-top: 6px; line-height: 1.5; }
+  .al-hint code { background: var(--panel2); border: 1px solid var(--border); border-radius: 3px; padding: 0 4px; cursor: pointer; color: var(--blue); }
+  .al-hint code:hover { border-color: var(--accent); }
+  .al-preview { margin-top: 10px; font-size: 12px; color: var(--text2); min-height: 16px; }
+  .al-preview.fires { color: var(--green); }
+  .al-preview.nofire { color: var(--text2); }
+  .al-preview.err { color: var(--red); }
 
   /* Floating drawing toolbar (appears on select) */
   #draw-toolbar {
@@ -281,6 +338,8 @@
     <div id="tfs" style="display:flex;gap:2px"></div>
     <div class="divider"></div>
     <button class="tb-btn" id="ind-toggle">&fnof; Indicators</button>
+    <div class="divider"></div>
+    <button class="tb-btn" id="alert-toggle" title="Alerts">&#9200; Alerts</button>
     <div class="spacer"></div>
   </div>
 
@@ -367,6 +426,92 @@
     <div id="dt-width-menu"></div>
     <button class="dt-btn" id="dt-settings" title="Settings"></button>
     <button class="dt-btn" id="dt-delete" title="Delete"></button>
+  </div>
+
+  <!-- Alerts side panel: list of alerts + fired log -->
+  <div id="alerts-panel">
+    <div class="ap-head">
+      <b>Alerts</b>
+      <div class="ap-head-btns">
+        <button id="alert-new" class="ap-new">+ New alert</button>
+        <button id="alerts-close" title="Close">&times;</button>
+      </div>
+    </div>
+    <div class="ap-tabs">
+      <button class="ap-tab active" data-atab="list">Alerts</button>
+      <button class="ap-tab" data-atab="log">Log</button>
+    </div>
+    <div id="ap-list" class="ap-body"></div>
+    <div id="ap-log" class="ap-body" style="display:none"></div>
+  </div>
+
+  <!-- Create / edit alert dialog -->
+  <div id="alert-dlg">
+    <div class="dlg-backdrop"></div>
+    <div class="dlg-box">
+      <div class="dlg-head">
+        <h3 id="alert-dlg-title">Create Alert</h3>
+        <button id="alert-dlg-close">&times;</button>
+      </div>
+      <div class="dlg-body">
+        <div class="dlg-group">CONDITION</div>
+        <div class="dlg-field"><label>Symbol</label><input id="al-symbol" spellcheck="false" /></div>
+        <div class="dlg-field"><label>Timeframe</label>
+          <select id="al-tf">
+            <option>1m</option><option>5m</option><option>15m</option><option>30m</option>
+            <option>1h</option><option>4h</option><option selected>1D</option>
+            <option>1W</option><option>1M</option>
+          </select>
+        </div>
+
+        <div class="dlg-field"><label>Left</label>
+          <select id="al-left-kind"><option value="price">Price</option><option value="indicator">Indicator</option></select>
+        </div>
+        <div class="dlg-field al-left-price"><label>Source</label><select id="al-left-source"></select></div>
+        <div class="dlg-field al-left-ind" style="display:none"><label>Indicator</label><select id="al-left-ind"></select></div>
+        <div class="dlg-field al-left-ind" style="display:none"><label>Plot</label><select id="al-left-plot"></select></div>
+        <div id="al-left-params"></div>
+
+        <div class="dlg-field"><label>Condition</label><select id="al-op"></select></div>
+
+        <div class="dlg-field"><label>Right</label>
+          <select id="al-right-kind">
+            <option value="value">Value</option>
+            <option value="price">Price</option>
+            <option value="indicator">Indicator</option>
+          </select>
+        </div>
+        <div class="dlg-field al-right-value"><label>Value</label><input id="al-right-value" type="number" step="any" value="0" /></div>
+        <div class="dlg-field al-right-price" style="display:none"><label>Source</label><select id="al-right-source"></select></div>
+        <div class="dlg-field al-right-ind" style="display:none"><label>Indicator</label><select id="al-right-ind"></select></div>
+        <div class="dlg-field al-right-ind" style="display:none"><label>Plot</label><select id="al-right-plot"></select></div>
+        <div id="al-right-params"></div>
+
+        <div class="dlg-group">TRIGGER</div>
+        <div class="dlg-field"><label>Frequency</label>
+          <select id="al-mode">
+            <option value="once">Once (then stop)</option>
+            <option value="recurring">Every time (recurring)</option>
+          </select>
+        </div>
+
+        <div class="dlg-group">WEBHOOK</div>
+        <div class="dlg-field" style="align-items:flex-start"><label>URL</label>
+          <input id="al-webhook" placeholder="https://…" spellcheck="false" style="width:220px" />
+        </div>
+        <div class="al-msg-wrap">
+          <label>Message (JSON or text)</label>
+          <textarea id="al-message" spellcheck="false" rows="5"></textarea>
+          <div class="al-hint" id="al-placeholders"></div>
+        </div>
+        <div class="al-preview" id="al-preview"></div>
+      </div>
+      <div class="dlg-foot">
+        <button id="al-test">Test</button>
+        <button id="al-cancel">Cancel</button>
+        <button id="al-save">Create</button>
+      </div>
+    </div>
   </div>
 
 <script src="/static/app.js?v={{ ver }}"></script>
