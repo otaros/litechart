@@ -332,6 +332,50 @@
   .ov-target-labels { display: flex; justify-content: space-between; color: var(--text2); font-size: 11px; margin-top: 4px; }
   .ov-summary { color: var(--text); font-size: 12px; line-height: 1.6; margin-top: 6px; max-height: 110px; overflow-y: auto; }
   .ov-empty { color: var(--text2); font-size: 13px; text-align: center; padding: 24px 8px; }
+
+  /* ── Screener tab ── */
+  .tab-btn.active { color: var(--text); background: var(--panel); }
+  #screener-view { flex: 1; min-height: 0; display: none; flex-direction: column; overflow: hidden; }
+  #screener-view.open { display: flex; }
+  #scr-controls {
+    display: flex; align-items: center; gap: 14px; padding: 10px 14px;
+    border-bottom: 1px solid var(--border); flex-shrink: 0; flex-wrap: wrap;
+  }
+  #scr-rules { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .scr-rule-chk { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text); cursor: pointer; user-select: none; }
+  .scr-rule-chk input { accent-color: var(--accent); cursor: pointer; }
+  .scr-ctl-group { display: flex; align-items: center; gap: 6px; }
+  .scr-lbl { color: var(--text2); font-size: 12px; }
+  #scr-tf {
+    height: 28px; padding: 0 8px; background: var(--panel2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 4px; font-size: 12px; font-family: inherit;
+  }
+  .scr-scan-btn { background: var(--accent); color: #fff; font-weight: 700; padding: 0 14px; }
+  .scr-scan-btn:hover { background: #1e53e5; color: #fff; }
+  .scr-scan-btn:disabled { opacity: .55; cursor: default; }
+  .scr-summary { color: var(--text2); font-size: 12px; }
+  #scr-table-wrap { flex: 1; min-height: 0; overflow: auto; padding: 0 14px 14px; }
+  #scr-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  #scr-table th {
+    position: sticky; top: 0; background: var(--bg); text-align: left; color: var(--text2);
+    font-weight: 600; padding: 10px 10px 8px; border-bottom: 1px solid var(--border); white-space: nowrap;
+  }
+  #scr-table td { padding: 9px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  #scr-table tbody tr { cursor: pointer; }
+  #scr-table tbody tr:hover { background: var(--panel); }
+  .scr-sym { font-weight: 700; font-size: 13px; }
+  .scr-chg.up { color: var(--green); }
+  .scr-chg.down { color: var(--red); }
+  .scr-badge {
+    display: inline-block; font-size: 11px; font-weight: 700; padding: 3px 9px;
+    border-radius: 10px; white-space: nowrap;
+  }
+  .scr-badge.buy { background: rgba(38,166,154,0.18); color: var(--green); }
+  .scr-badge.sell { background: rgba(239,83,80,0.18); color: var(--red); }
+  .scr-badge.neutral { background: var(--panel2); color: var(--text2); }
+  .scr-badge-label { color: var(--text2); font-size: 10px; margin-top: 3px; display: block; }
+  .scr-row-err { color: var(--text2); font-style: italic; }
+  .scr-empty { color: var(--text2); font-size: 13px; text-align: center; padding: 40px 8px; }
   .ov-loading { color: var(--text2); font-size: 13px; text-align: center; padding: 24px 8px; }
 
   /* Floating drawing toolbar (appears on select) */
@@ -395,6 +439,9 @@
     <button class="tb-btn" id="ind-toggle">&fnof; Indicators</button>
     <div class="divider"></div>
     <button class="tb-btn" id="alert-toggle" title="Alerts">&#9200; Alerts</button>
+    <div class="divider"></div>
+    <button class="tb-btn tab-btn active" id="tab-chart-btn">Chart</button>
+    <button class="tb-btn tab-btn" id="tab-screener-btn">&#128269; Screener</button>
     <div class="spacer"></div>
   </div>
 
@@ -415,6 +462,29 @@
         <input id="ind-search" placeholder="Search indicators…" autocomplete="off" spellcheck="false" />
         <div id="ind-list"></div>
       </div>
+    </div>
+  </div>
+
+  <!-- Screener tab: scans Watchlist tickers, one BUY/SELL/NEUTRAL verdict
+       per selected rule, using the same indicator math as the chart. No
+       chart/candle data is stored — it's computed fresh on every scan. -->
+  <div id="screener-view">
+    <div id="scr-controls">
+      <div id="scr-rules"></div>
+      <div class="scr-ctl-group">
+        <label class="scr-lbl">Timeframe</label>
+        <select id="scr-tf"></select>
+      </div>
+      <button class="tb-btn scr-scan-btn" id="scr-scan">&#9654; Scan</button>
+      <div class="spacer"></div>
+      <span id="scr-summary" class="scr-summary"></span>
+    </div>
+    <div id="scr-table-wrap">
+      <table id="scr-table">
+        <thead><tr id="scr-thead"></tr></thead>
+        <tbody id="scr-tbody"></tbody>
+      </table>
+      <div id="scr-empty" class="scr-empty"></div>
     </div>
   </div>
 

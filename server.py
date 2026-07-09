@@ -12,6 +12,7 @@ then open http://127.0.0.1:5000
 """
 
 import atexit
+import math
 import os
 import signal
 import socket
@@ -620,8 +621,10 @@ def _resample_ohlcv(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
     }).dropna()
 
 
-def _fetch_yahoo_df(symbol: str, timeframe: str) -> pd.DataFrame:
+def _fetch_yahoo_df(symbol: str, timeframe: str, period_override: str = None) -> pd.DataFrame:
     period, interval = PERIOD_MAP.get(timeframe, ("1y", "1d"))
+    if period_override:
+        period = period_override
     last_err = ""
     for attempt in range(3):
         if attempt > 0:
@@ -645,13 +648,15 @@ def _fetch_yahoo_df(symbol: str, timeframe: str) -> pd.DataFrame:
     raise RuntimeError(last_err or "Unknown fetch error")
 
 
-def _fetch_alpaca_df(symbol: str, timeframe: str) -> pd.DataFrame:
+def _fetch_alpaca_df(symbol: str, timeframe: str, lookback_override: timedelta = None) -> pd.DataFrame:
     """Raises on any failure (bad/unsupported symbol, auth, rate limit, no
     data) so the caller can decide whether to fall back to Yahoo.
     """
     from alpaca.data.requests import StockBarsRequest
 
     tf_obj, lookback = _ALPACA_TF_MAP.get(timeframe, _ALPACA_TF_MAP["1D"])
+    if lookback_override is not None:
+        lookback = lookback_override
     req = StockBarsRequest(
         symbol_or_symbols=symbol,
         timeframe=tf_obj,
@@ -686,6 +691,112 @@ def _fetch_df_uncached(symbol: str, timeframe: str) -> pd.DataFrame:
             print(f"[litechart] Alpaca fetch failed for '{symbol}' ({timeframe}): {e} "
                   f"— falling back to Yahoo Finance.")
     return _fetch_yahoo_df(symbol, timeframe)
+
+
+def _fetch_df_bounded(symbol: str, timeframe: str, days: int) -> pd.DataFrame:
+    """Like _fetch_df_uncached(), but caps the lookback to ~`days` calendar
+    days instead of the full chart-length history. Used only by the
+    screener's reduced-history path (see fetch_screener_df below).
+    """
+    if _ALPACA_CLIENT is not None:
+        try:
+            return _fetch_alpaca_df(symbol, timeframe, lookback_override=timedelta(days=days))
+        except Exception as e:  # noqa: BLE001
+            if not ALPACA_FALLBACK_YAHOO:
+                raise
+            print(f"[litechart] Alpaca fetch failed for '{symbol}' ({timeframe}): {e} "
+                  f"— falling back to Yahoo Finance.")
+    # Yahoo's period param wants coarse buckets ("1y", "2y", …) rather than
+    # arbitrary day counts, so round up to the nearest year.
+    years = max(1, math.ceil(days / 365))
+    return _fetch_yahoo_df(symbol, timeframe, period_override=f"{years}y")
+
+
+# ─────────────────────── Screener reduced-lookback fetch ────────────────
+# Screener rule functions only ever read the last 1-2 rows of each computed
+# indicator (e.g. rsi.iloc[-1]), so a scan never needs the full chart-length
+# history (15y of daily bars, "max" weekly/monthly, …) — just enough
+# trailing bars for the longest indicator lookback among the *selected*
+# rules, plus a buffer so EWM-style indicators (MACD, ADX, Supertrend) have
+# settled by the last bar. This only applies to 1D/1W/1M, where the normal
+# chart lookback is wildly larger than any rule needs; intraday timeframes
+# already use provider-bounded windows (7d/60d/730d) that aren't worth
+# further trimming. Local pandas compute cost is negligible either way —
+# this is purely about cutting the upstream Alpaca/Yahoo fetch on a cold
+# cache, not about CPU.
+_SCREENER_DF_CACHE: dict = {}          # (symbol, timeframe) -> (fetched_at, days_used, df)
+_SCREENER_MAX_DAYS = {"1D": 15 * 365, "1W": 20 * 365, "1M": 20 * 365}
+
+
+def _rule_min_bars(rule_id: str, params: dict) -> int:
+    """Trailing bars needed for `rule_id` to produce a stable, non-NaN
+    signal on the most recent bar. EWM-based indicators (MACD/ADX/
+    Supertrend) get an extra multiplier since they need several periods to
+    converge, not just their nominal window length."""
+    p = params
+    if rule_id == "rsi":
+        return int(p["length"]) * 4 + 10
+    if rule_id == "macd_cross":
+        return int(p["slow"]) * 3 + int(p["signal"]) * 3 + 10
+    if rule_id == "ma_cross":
+        return int(p["slow"]) + 10
+    if rule_id == "bb_touch":
+        return int(p["length"]) + 10
+    if rule_id == "stoch":
+        return int(p["k_length"]) + int(p["d_length"]) + 10
+    if rule_id == "williams_r":
+        return int(p["length"]) + 10
+    if rule_id == "cci":
+        return int(p["length"]) + 10
+    if rule_id == "mfi":
+        return int(p["length"]) + 10
+    if rule_id == "adx_cross":
+        return int(p["length"]) * 4 + 20
+    if rule_id == "supertrend_flip":
+        return int(p["length"]) * 4 + 20
+    return 250   # unknown rule — safe fallback
+
+
+def _screener_lookback_days(timeframe: str, min_bars: int) -> int:
+    """Calendar days comfortably covering `min_bars` trailing bars of
+    `timeframe`, capped at the timeframe's normal full-history ceiling."""
+    if timeframe == "1D":
+        needed = int(min_bars * (7 / 5) * 1.35) + 30    # trading→calendar days + holiday buffer
+    elif timeframe == "1W":
+        needed = int(min_bars * 7 * 1.35) + 60
+    elif timeframe == "1M":
+        needed = int(min_bars * 30 * 1.35) + 90
+    else:
+        needed = _SCREENER_MAX_DAYS.get(timeframe, 10 ** 9)
+    return min(needed, _SCREENER_MAX_DAYS.get(timeframe, needed))
+
+
+def fetch_screener_df(symbol: str, timeframe: str, min_bars: int) -> pd.DataFrame:
+    """Like fetch_df(), but for 1D/1W/1M only fetches enough trailing bars
+    for the rules being scanned. Other timeframes delegate straight to the
+    normal fetch_df() (see module docstring above for why).
+    """
+    if timeframe not in _SCREENER_MAX_DAYS:
+        return fetch_df(symbol, timeframe)
+
+    sym = symbol.upper()
+    # A fresh full chart-length fetch (from the chart/indicator endpoints)
+    # already covers any min_bars — reuse it instead of fetching again.
+    full_cached = _DF_CACHE.get((sym, timeframe))
+    if full_cached is not None and (time.time() - full_cached[0]) < _DF_TTL:
+        return full_cached[1]
+
+    days = _screener_lookback_days(timeframe, min_bars)
+    key = (sym, timeframe)
+    cached = _SCREENER_DF_CACHE.get(key)
+    if cached is not None:
+        fetched_at, days_used, df = cached
+        if (time.time() - fetched_at) < _DF_TTL and days_used >= days:
+            return df
+
+    df = _fetch_df_bounded(sym, timeframe, days)
+    _SCREENER_DF_CACHE[key] = (time.time(), days, df)
+    return df
 
 
 # ─────────────────────────── Serialization ────────────────────────────
@@ -1269,6 +1380,252 @@ def api_overview():
         return jsonify(fetch_overview(symbol))
     except Exception as e:  # noqa: BLE001
         return jsonify({"error": str(e)}), 502
+
+
+# ─────────────────────────── Screener ──────────────────────────────────
+# Scans a list of tickers (the frontend's own Watchlist — nothing is stored
+# server-side) and reduces each one to a BUY/SELL/NEUTRAL verdict per rule,
+# using the exact same indicator math already used for charting (rsi, macd,
+# sma, bollinger). No candle history is persisted — each scan just reuses
+# fetch_df()'s normal 60s cache.
+SCREENER_RULES = {
+    "rsi": {
+        "name": "RSI Oversold / Overbought",
+        "defaults": {"length": 14, "oversold": 30, "overbought": 70},
+    },
+    "macd_cross": {
+        "name": "MACD Bullish / Bearish Cross",
+        "defaults": {"fast": 12, "slow": 26, "signal": 9},
+    },
+    "ma_cross": {
+        "name": "MA Cross (Golden / Death Cross)",
+        "defaults": {"fast": 50, "slow": 200},
+    },
+    "bb_touch": {
+        "name": "Bollinger Band Touch",
+        "defaults": {"length": 20, "mult": 2.0},
+    },
+    "stoch": {
+        "name": "Stochastic Oversold / Overbought",
+        "defaults": {"k_length": 14, "d_length": 3, "oversold": 20, "overbought": 80},
+    },
+    "williams_r": {
+        "name": "Williams %R Oversold / Overbought",
+        "defaults": {"length": 14, "oversold": -80, "overbought": -20},
+    },
+    "cci": {
+        "name": "CCI Oversold / Overbought",
+        "defaults": {"length": 20, "oversold": -100, "overbought": 100},
+    },
+    "mfi": {
+        "name": "Money Flow Index (MFI)",
+        "defaults": {"length": 14, "oversold": 20, "overbought": 80},
+    },
+    "adx_cross": {
+        "name": "ADX/DMI +DI/-DI Cross",
+        "defaults": {"length": 14, "min_adx": 20},
+    },
+    "supertrend_flip": {
+        "name": "Supertrend Flip",
+        "defaults": {"length": 10, "mult": 3.0},
+    },
+}
+
+
+def _signal_rsi(df: pd.DataFrame, p: dict) -> dict:
+    length = int(p["length"])
+    oversold, overbought = float(p["oversold"]), float(p["overbought"])
+    r = rsi(df["Close"], length)
+    if r.empty or pd.isna(r.iloc[-1]):
+        return {"verdict": "NEUTRAL", "label": "not enough history", "value": None}
+    v = round(float(r.iloc[-1]), 1)
+    if v <= oversold:
+        return {"verdict": "BUY", "label": f"RSI {v} (oversold)", "value": v}
+    if v >= overbought:
+        return {"verdict": "SELL", "label": f"RSI {v} (overbought)", "value": v}
+    return {"verdict": "NEUTRAL", "label": f"RSI {v}", "value": v}
+
+
+def _signal_macd_cross(df: pd.DataFrame, p: dict) -> dict:
+    line, sig, _ = macd(df["Close"], int(p["fast"]), int(p["slow"]), int(p["signal"]))
+    if len(line) < 2 or pd.isna(line.iloc[-1]) or pd.isna(sig.iloc[-1]) or pd.isna(line.iloc[-2]):
+        return {"verdict": "NEUTRAL", "label": "not enough history", "value": None}
+    d_now, d_prev = line.iloc[-1] - sig.iloc[-1], line.iloc[-2] - sig.iloc[-2]
+    state = "Bullish" if d_now > 0 else "Bearish"
+    if d_prev <= 0 < d_now:
+        return {"verdict": "BUY", "label": "Fresh bullish cross", "value": round(float(d_now), 3)}
+    if d_prev >= 0 > d_now:
+        return {"verdict": "SELL", "label": "Fresh bearish cross", "value": round(float(d_now), 3)}
+    return {"verdict": "NEUTRAL", "label": f"{state}, no fresh cross", "value": round(float(d_now), 3)}
+
+
+def _signal_ma_cross(df: pd.DataFrame, p: dict) -> dict:
+    fast_n, slow_n = int(p["fast"]), int(p["slow"])
+    f, s = sma(df["Close"], fast_n), sma(df["Close"], slow_n)
+    if len(f) < 2 or pd.isna(f.iloc[-1]) or pd.isna(s.iloc[-1]) or pd.isna(f.iloc[-2]) or pd.isna(s.iloc[-2]):
+        return {"verdict": "NEUTRAL", "label": "not enough history", "value": None}
+    d_now, d_prev = f.iloc[-1] - s.iloc[-1], f.iloc[-2] - s.iloc[-2]
+    state = f"SMA{fast_n} {'>' if d_now > 0 else '<'} SMA{slow_n}"
+    if d_prev <= 0 < d_now:
+        return {"verdict": "BUY", "label": f"Golden cross (SMA{fast_n}/{slow_n})", "value": round(float(d_now), 3)}
+    if d_prev >= 0 > d_now:
+        return {"verdict": "SELL", "label": f"Death cross (SMA{fast_n}/{slow_n})", "value": round(float(d_now), 3)}
+    return {"verdict": "NEUTRAL", "label": f"{state}, no fresh cross", "value": round(float(d_now), 3)}
+
+
+def _signal_bb_touch(df: pd.DataFrame, p: dict) -> dict:
+    lo, mid, hi = bollinger(df["Close"], int(p["length"]), float(p["mult"]))
+    if pd.isna(hi.iloc[-1]) or pd.isna(lo.iloc[-1]):
+        return {"verdict": "NEUTRAL", "label": "not enough history", "value": None}
+    close = float(df["Close"].iloc[-1])
+    if close >= float(hi.iloc[-1]):
+        return {"verdict": "SELL", "label": f"Touching upper band ({hi.iloc[-1]:.2f})", "value": close}
+    if close <= float(lo.iloc[-1]):
+        return {"verdict": "BUY", "label": f"Touching lower band ({lo.iloc[-1]:.2f})", "value": close}
+    return {"verdict": "NEUTRAL", "label": "Inside bands", "value": close}
+
+
+def _signal_stoch(df: pd.DataFrame, p: dict) -> dict:
+    k, _ = stochastic(df, int(p["k_length"]), int(p["d_length"]))
+    oversold, overbought = float(p["oversold"]), float(p["overbought"])
+    if k.empty or pd.isna(k.iloc[-1]):
+        return {"verdict": "NEUTRAL", "label": "not enough history", "value": None}
+    v = round(float(k.iloc[-1]), 1)
+    if v <= oversold:
+        return {"verdict": "BUY", "label": f"%K {v} (oversold)", "value": v}
+    if v >= overbought:
+        return {"verdict": "SELL", "label": f"%K {v} (overbought)", "value": v}
+    return {"verdict": "NEUTRAL", "label": f"%K {v}", "value": v}
+
+
+def _signal_williams_r(df: pd.DataFrame, p: dict) -> dict:
+    w = williams_r(df, int(p["length"]))
+    oversold, overbought = float(p["oversold"]), float(p["overbought"])
+    if w.empty or pd.isna(w.iloc[-1]):
+        return {"verdict": "NEUTRAL", "label": "not enough history", "value": None}
+    v = round(float(w.iloc[-1]), 1)
+    if v <= oversold:
+        return {"verdict": "BUY", "label": f"%R {v} (oversold)", "value": v}
+    if v >= overbought:
+        return {"verdict": "SELL", "label": f"%R {v} (overbought)", "value": v}
+    return {"verdict": "NEUTRAL", "label": f"%R {v}", "value": v}
+
+
+def _signal_cci(df: pd.DataFrame, p: dict) -> dict:
+    c = cci(df, int(p["length"]))
+    oversold, overbought = float(p["oversold"]), float(p["overbought"])
+    if c.empty or pd.isna(c.iloc[-1]):
+        return {"verdict": "NEUTRAL", "label": "not enough history", "value": None}
+    v = round(float(c.iloc[-1]), 1)
+    if v <= oversold:
+        return {"verdict": "BUY", "label": f"CCI {v} (oversold)", "value": v}
+    if v >= overbought:
+        return {"verdict": "SELL", "label": f"CCI {v} (overbought)", "value": v}
+    return {"verdict": "NEUTRAL", "label": f"CCI {v}", "value": v}
+
+
+def _signal_mfi(df: pd.DataFrame, p: dict) -> dict:
+    m = mfi(df, int(p["length"]))
+    oversold, overbought = float(p["oversold"]), float(p["overbought"])
+    if m.empty or pd.isna(m.iloc[-1]):
+        return {"verdict": "NEUTRAL", "label": "not enough history", "value": None}
+    v = round(float(m.iloc[-1]), 1)
+    if v <= oversold:
+        return {"verdict": "BUY", "label": f"MFI {v} (oversold)", "value": v}
+    if v >= overbought:
+        return {"verdict": "SELL", "label": f"MFI {v} (overbought)", "value": v}
+    return {"verdict": "NEUTRAL", "label": f"MFI {v}", "value": v}
+
+
+def _signal_adx_cross(df: pd.DataFrame, p: dict) -> dict:
+    plus_di, minus_di, adx = adx_dmi(df, int(p["length"]))
+    min_adx = float(p["min_adx"])
+    if len(plus_di) < 2 or pd.isna(plus_di.iloc[-1]) or pd.isna(minus_di.iloc[-1]) or pd.isna(plus_di.iloc[-2]):
+        return {"verdict": "NEUTRAL", "label": "not enough history", "value": None}
+    d_now, d_prev = plus_di.iloc[-1] - minus_di.iloc[-1], plus_di.iloc[-2] - minus_di.iloc[-2]
+    adx_now = 0.0 if pd.isna(adx.iloc[-1]) else float(adx.iloc[-1])
+    strong = adx_now >= min_adx
+    state = "+DI > -DI" if d_now > 0 else "+DI < -DI"
+    if d_prev <= 0 < d_now and strong:
+        return {"verdict": "BUY", "label": f"Bullish DI cross (ADX {adx_now:.0f})", "value": round(float(d_now), 2)}
+    if d_prev >= 0 > d_now and strong:
+        return {"verdict": "SELL", "label": f"Bearish DI cross (ADX {adx_now:.0f})", "value": round(float(d_now), 2)}
+    return {"verdict": "NEUTRAL", "label": f"{state}, no fresh/strong cross", "value": round(float(d_now), 2)}
+
+
+def _signal_supertrend_flip(df: pd.DataFrame, p: dict) -> dict:
+    st = supertrend(df, int(p["length"]), float(p["mult"]))
+    if len(st) < 2 or pd.isna(st.iloc[-1]) or pd.isna(st.iloc[-2]):
+        return {"verdict": "NEUTRAL", "label": "not enough history", "value": None}
+    up_now = df["Close"].iloc[-1] > st.iloc[-1]
+    up_prev = df["Close"].iloc[-2] > st.iloc[-2]
+    if up_now and not up_prev:
+        return {"verdict": "BUY", "label": "Flipped bullish", "value": round(float(st.iloc[-1]), 2)}
+    if not up_now and up_prev:
+        return {"verdict": "SELL", "label": "Flipped bearish", "value": round(float(st.iloc[-1]), 2)}
+    return {"verdict": "NEUTRAL", "label": f"{'Bullish' if up_now else 'Bearish'}, no flip", "value": round(float(st.iloc[-1]), 2)}
+
+
+_SCREENER_FUNCS = {
+    "rsi": _signal_rsi,
+    "macd_cross": _signal_macd_cross,
+    "ma_cross": _signal_ma_cross,
+    "bb_touch": _signal_bb_touch,
+    "stoch": _signal_stoch,
+    "williams_r": _signal_williams_r,
+    "cci": _signal_cci,
+    "mfi": _signal_mfi,
+    "adx_cross": _signal_adx_cross,
+    "supertrend_flip": _signal_supertrend_flip,
+}
+
+
+@app.route("/api/screener/rules")
+def api_screener_rules():
+    return jsonify(SCREENER_RULES)
+
+
+@app.route("/api/screener")
+def api_screener():
+    symbols = [s.strip().upper() for s in (request.args.get("symbols") or "").split(",") if s.strip()]
+    tf = request.args.get("tf") or "1D"
+    rules = [r.strip() for r in (request.args.get("rules") or "").split(",") if r.strip() in _SCREENER_FUNCS]
+    if not rules:
+        rules = list(_SCREENER_FUNCS.keys())
+
+    def params_for(rule_id: str) -> dict:
+        out = dict(SCREENER_RULES[rule_id]["defaults"])
+        for k in out:
+            v = request.args.get(f"{rule_id}_{k}")
+            if v is not None:
+                out[k] = v
+        return out
+
+    rule_params = {r: params_for(r) for r in rules}
+    min_bars = max((_rule_min_bars(r, rule_params[r]) for r in rules), default=250)
+    results = []
+    for sym in symbols[:200]:
+        try:
+            df = fetch_screener_df(sym, tf, min_bars)
+            if df is None or df.empty:
+                results.append({"symbol": sym, "error": "No data — check the symbol."})
+                continue
+            price = float(df["Close"].iloc[-1])
+            prev = float(df["Close"].iloc[-2]) if len(df) > 1 else price
+            change_pct = ((price - prev) / prev * 100.0) if prev else 0.0
+            signals = {}
+            for r in rules:
+                try:
+                    signals[r] = _SCREENER_FUNCS[r](df, rule_params[r])
+                except Exception as e:  # noqa: BLE001
+                    signals[r] = {"verdict": "NEUTRAL", "label": f"error: {e}", "value": None}
+            results.append({
+                "symbol": sym, "price": round(price, 4),
+                "changePct": round(change_pct, 2), "signals": signals, "error": None,
+            })
+        except Exception as e:  # noqa: BLE001
+            results.append({"symbol": sym, "error": str(e)})
+    return jsonify({"timeframe": tf, "rules": rules, "results": results})
 
 
 # Short-lived cache for symbol-search queries so repeated keystrokes for the

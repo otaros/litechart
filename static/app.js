@@ -3778,6 +3778,144 @@ const Overview = (() => {
   return { open };
 })();
 
+// ─────────────────────────── Screener tab ──────────────────────────────
+// Scans the Watchlist's tickers and reduces each one to a BUY/SELL/NEUTRAL
+// verdict per selected rule (server-computed from the same indicator math
+// used for charting). Nothing about the scan is persisted except the user's
+// rule/timeframe picks (tiny UI prefs, not chart/candle data).
+const Screener = (() => {
+  const SCREENER_KEY = "tt.screener.v1";
+  const chartBtn = document.getElementById("tab-chart-btn");
+  const screenerBtn = document.getElementById("tab-screener-btn");
+  const bodyEl = document.getElementById("body");
+  const viewEl = document.getElementById("screener-view");
+  const rulesEl = document.getElementById("scr-rules");
+  const tfSel = document.getElementById("scr-tf");
+  const scanBtn = document.getElementById("scr-scan");
+  const summaryEl = document.getElementById("scr-summary");
+  const theadEl = document.getElementById("scr-thead");
+  const tbodyEl = document.getElementById("scr-tbody");
+  const emptyEl = document.getElementById("scr-empty");
+
+  let ruleMeta = null;      // { rsi: {name, defaults}, ... } from the backend
+  let loadedOnce = false;
+
+  function loadPrefs() {
+    try {
+      const raw = localStorage.getItem(SCREENER_KEY);
+      return raw ? JSON.parse(raw) : {};
+    } catch (e) { return {}; }
+  }
+  function savePrefs(p) {
+    try { localStorage.setItem(SCREENER_KEY, JSON.stringify(p)); } catch (e) {}
+  }
+
+  function selectedRules() {
+    return Array.from(rulesEl.querySelectorAll("input[type=checkbox]:checked")).map((c) => c.value);
+  }
+
+  async function ensureLoaded() {
+    if (loadedOnce) return;
+    loadedOnce = true;
+    const prefs = loadPrefs();
+    tfSel.innerHTML = TIMEFRAMES.map((tf) =>
+      `<option value="${tf}" ${tf === (prefs.tf || "1D") ? "selected" : ""}>${tf}</option>`).join("");
+    try {
+      ruleMeta = await (await fetch("/api/screener/rules")).json();
+    } catch (e) {
+      ruleMeta = {};
+    }
+    const savedRules = Array.isArray(prefs.rules) && prefs.rules.length ? prefs.rules : Object.keys(ruleMeta);
+    rulesEl.innerHTML = Object.entries(ruleMeta).map(([id, spec]) => `
+      <label class="scr-rule-chk">
+        <input type="checkbox" value="${id}" ${savedRules.includes(id) ? "checked" : ""} />
+        ${spec.name}
+      </label>`).join("");
+  }
+
+  function switchTab(which) {
+    const toScreener = which === "screener";
+    screenerBtn.classList.toggle("active", toScreener);
+    chartBtn.classList.toggle("active", !toScreener);
+    viewEl.classList.toggle("open", toScreener);
+    bodyEl.style.display = toScreener ? "none" : "flex";
+    if (toScreener) ensureLoaded();
+  }
+
+  function badge(sig) {
+    if (!sig) return `<span class="scr-badge neutral">n/a</span>`;
+    const cls = sig.verdict === "BUY" ? "buy" : sig.verdict === "SELL" ? "sell" : "neutral";
+    return `<span class="scr-badge ${cls}">${sig.verdict}</span><span class="scr-badge-label">${sig.label || ""}</span>`;
+  }
+
+  function renderTable(rules, results) {
+    theadEl.innerHTML = `<th>Symbol</th><th>Price</th><th>Chg %</th>` +
+      rules.map((r) => `<th>${(ruleMeta[r] && ruleMeta[r].name) || r}</th>`).join("");
+    tbodyEl.innerHTML = results.map((row) => {
+      if (row.error) {
+        return `<tr data-sym="${row.symbol}"><td class="scr-sym">${row.symbol}</td>
+          <td colspan="${2 + rules.length}" class="scr-row-err">${row.error}</td></tr>`;
+      }
+      const chgCls = row.changePct > 0 ? "up" : row.changePct < 0 ? "down" : "";
+      const chgSign = row.changePct > 0 ? "+" : "";
+      return `<tr data-sym="${row.symbol}">
+        <td class="scr-sym">${row.symbol}</td>
+        <td>${row.price != null ? row.price.toFixed(2) : "—"}</td>
+        <td class="scr-chg ${chgCls}">${chgSign}${row.changePct.toFixed(2)}%</td>
+        ${rules.map((r) => `<td>${badge(row.signals && row.signals[r])}</td>`).join("")}
+      </tr>`;
+    }).join("");
+    tbodyEl.querySelectorAll("tr").forEach((tr) => {
+      tr.addEventListener("click", () => {
+        document.getElementById("symbol").value = tr.dataset.sym;
+        switchTab("chart");
+        loadData();
+      });
+    });
+  }
+
+  async function scan() {
+    const list = loadWatchlist();
+    const rules = selectedRules();
+    const tf = tfSel.value;
+    savePrefs({ rules, tf });
+    if (!list.length) {
+      emptyEl.textContent = "Your Watchlist is empty — add symbols with the ☆ star, then Scan.";
+      emptyEl.style.display = "block";
+      theadEl.innerHTML = ""; tbodyEl.innerHTML = ""; summaryEl.textContent = "";
+      return;
+    }
+    if (!rules.length) {
+      emptyEl.textContent = "Pick at least one rule to scan with.";
+      emptyEl.style.display = "block";
+      theadEl.innerHTML = ""; tbodyEl.innerHTML = ""; summaryEl.textContent = "";
+      return;
+    }
+    emptyEl.style.display = "none";
+    scanBtn.disabled = true;
+    summaryEl.textContent = `Scanning ${list.length} symbol${list.length > 1 ? "s" : ""} …`;
+    try {
+      const qs = new URLSearchParams({ symbols: list.join(","), tf, rules: rules.join(",") });
+      const res = await fetch("/api/screener?" + qs.toString());
+      const data = await res.json();
+      renderTable(data.rules || rules, data.results || []);
+      const buys = (data.results || []).reduce((n, r) => n + Object.values(r.signals || {}).filter((s) => s.verdict === "BUY").length, 0);
+      const sells = (data.results || []).reduce((n, r) => n + Object.values(r.signals || {}).filter((s) => s.verdict === "SELL").length, 0);
+      summaryEl.textContent = `${list.length} symbols · ${data.timeframe} · ${buys} buy signal${buys === 1 ? "" : "s"}, ${sells} sell signal${sells === 1 ? "" : "s"}`;
+    } catch (e) {
+      summaryEl.textContent = "Scan failed: " + e.message;
+    } finally {
+      scanBtn.disabled = false;
+    }
+  }
+
+  chartBtn.addEventListener("click", () => switchTab("chart"));
+  screenerBtn.addEventListener("click", () => switchTab("screener"));
+  scanBtn.addEventListener("click", scan);
+
+  return { switchTab };
+})();
+
 async function init() {
   try {
     const cat = await (await fetch("/api/catalog")).json();
