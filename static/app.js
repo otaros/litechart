@@ -440,6 +440,28 @@ const PLOT_STYLE_HINTS = {
   bb_lower: { color: C.text2, width: 1, lineStyle: "dashed", visible: true },
 };
 
+// Human-readable names for each indicator's plots (shown in the Style tab and
+// legend) so users see e.g. "MACD" / "Signal" instead of "Plot 1" / "Plot 2".
+// Keyed by indicator type → plot key → label. Falls back to a generic label.
+const PLOT_LABELS = {
+  macd:     { plot0: "MACD", plot1: "Signal", hist: "Histogram" },
+  stoch:    { plot0: "%K", plot1: "%D" },
+  stochrsi: { plot0: "%K", plot1: "%D" },
+  kdj:      { plot0: "K", plot1: "D", plot2: "J" },
+  adx:      { plot0: "ADX", plot1: "+DI", plot2: "-DI" },
+  bb:       { plot0: "Upper", plot1: "Basis", plot2: "Lower" },
+  keltner:  { plot0: "Upper", plot1: "Basis", plot2: "Lower" },
+  donchian: { plot0: "Upper", plot1: "Basis", plot2: "Lower" },
+  tsi:      { plot0: "TSI" },
+  rsi:      { plot0: "RSI", ma: "MA", bb_upper: "Upper Band", bb_lower: "Lower Band" },
+};
+
+function plotLabel(inst, plotKey, index) {
+  const byType = PLOT_LABELS[inst.type];
+  if (byType && byType[plotKey]) return byType[plotKey];
+  return inst.plots.length > 1 ? "Plot " + index : "Line";
+}
+
 function reconcilePlots(inst, plotOrder) {
   // RSI (and future dynamic indicators) may return a different set/order of
   // plots depending on inputs. Keep styles for surviving plots, add defaults
@@ -558,9 +580,9 @@ function renderPriceLegend(bar, volVal, prevClose, crosshairVals) {
     const pct = prevClose ? (chg / prevClose) * 100 : 0;
     const sign = chg >= 0 ? "+" : "";
     const fullName = lastData.name && lastData.name !== lastData.symbol
-      ? `<span class="lg-name">${lastData.name}</span>` : "";
+      ? `<span class="lg-name clickable" id="lg-overview-btn" title="Click for overview">${lastData.name}</span>` : "";
     html += `<div class="lg-row">` +
-      `<b style="color:${C.text};font-size:13px">${lastData.symbol}</b>` +
+      `<b class="lg-sym-click" id="lg-overview-sym" style="color:${C.text};font-size:13px" title="Click for overview">${lastData.symbol}</b>` +
       fullName +
       `<span class="k">${lastData.timeframe}</span>` +
       `<span style="color:${col};margin-left:8px">O<b> ${bar.open.toFixed(2)}</b>  H<b> ${bar.high.toFixed(2)}</b>  ` +
@@ -792,6 +814,47 @@ async function loadData() {
     if (typeof refreshWatchStar === "function") refreshWatchStar();
     setStatus(`${data.symbol} · ${data.timeframe} · ${data.candles.length} bars`);
   } catch (e) { setStatus("Error: " + e.message, true); }
+}
+
+// ─────────────────────────── Live price polling ────────────────────────
+// The initial load is a one-shot fetch, so the chart would otherwise sit
+// frozen until the user reloads. Poll for fresh bars periodically and patch
+// just the last candle/volume point in place — no setData()/fitContent(),
+// so zoom, scroll position, and drawings are left completely undisturbed.
+// The actual upstream Alpaca/Yahoo call only happens once per _DF_TTL (60s)
+// server-side cache window; polling more often than that just re-reads cache.
+const LIVE_POLL_MS = 8000;
+let _liveTimer = null;
+
+function startLivePolling() {
+  if (_liveTimer) return;
+  _liveTimer = setInterval(refreshLiveBar, LIVE_POLL_MS);
+}
+
+async function refreshLiveBar() {
+  if (document.hidden || !currentSymbol) return;   // pause while tab is backgrounded
+  try {
+    const res = await fetch(`/api/data?symbol=${encodeURIComponent(currentSymbol)}&tf=${currentTf}`);
+    const data = await res.json();
+    if (data.error || !data.candles || !data.candles.length) return;
+    // Guard against a race with a concurrent full loadData() (symbol/tf
+    // change) landing in between — only patch if still on the same chart.
+    if (data.symbol !== currentSymbol || data.timeframe !== currentTf) return;
+    lastData = data;
+    window.__realBars = data.candles.length;
+    window.__vol = (data.volume || []).map((p) => (p && typeof p.value === "number" ? p.value : 0));
+    const lastCandle = data.candles[data.candles.length - 1];
+    const lastVol = data.volume && data.volume[data.volume.length - 1];
+    // historicalUpdate=true: our real bars sit *before* the future whitespace
+    // tail already in the series, so this is never the literal "last point".
+    candleSeries.update(lastCandle, true);
+    if (lastVol) volumeSeries.update(lastVol, true);
+    if (window.__bars && window.__bars.length >= data.candles.length) {
+      window.__bars[data.candles.length - 1] = lastCandle;
+    }
+    refetchAll();
+    renderLegends();
+  } catch (e) { /* a missed live tick is not worth surfacing to the user */ }
 }
 
 // ─────────────────────────── Wheel-over-price stretch ─────────────────
@@ -2848,7 +2911,7 @@ function buildStyleTab(inst) {
     const st = inst.style[i];
     const row = document.createElement("div"); row.className = "dlg-style-row"; row.dataset.idx = i;
     row.innerHTML =
-      `<span class="dlg-plot">${inst.plots.length > 1 ? "Plot " + i : "Line"}</span>` +
+      `<span class="dlg-plot">${plotLabel(inst, pk, i)}</span>` +
       `<input type="checkbox" class="st-vis" ${st.visible ? "checked" : ""} title="Visible">` +
       `<input type="color" class="st-color" value="${toHex(st.color)}">` +
       `<select class="st-width" title="Width">${[1, 2, 3, 4].map((w) => `<option ${w === st.width ? "selected" : ""}>${w}</option>`).join("")}</select>` +
@@ -3128,7 +3191,88 @@ document.getElementById("dt-settings").addEventListener("click", () => drawings.
 document.getElementById("dt-delete").addEventListener("click", () => drawings.deleteSelected());
 
 // ─────────────────────────── Symbol / init ────────────────────────────
-document.getElementById("symbol").addEventListener("keydown", (e) => { if (e.key === "Enter") loadData(); });
+// Symbol autocomplete: debounced Yahoo search with a dropdown, keyboard nav
+// (↑/↓/Enter/Esc) and click selection. Falls back to plain load on Enter.
+const symInput = document.getElementById("symbol");
+const symSuggest = document.getElementById("sym-suggest");
+let symResults = [];
+let symActive = -1;       // highlighted index in the dropdown
+let symDebounce = null;
+let symSeq = 0;           // guards against out-of-order async responses
+
+function positionSymSuggest() {
+  const r = symInput.getBoundingClientRect();
+  symSuggest.style.left = r.left + "px";
+  symSuggest.style.top = (r.bottom + 4) + "px";
+}
+
+function closeSymSuggest() {
+  symSuggest.classList.remove("open");
+  symActive = -1;
+}
+
+function renderSymSuggest() {
+  if (!symResults.length) {
+    symSuggest.innerHTML = `<div class="sug-empty">No matches</div>`;
+  } else {
+    symSuggest.innerHTML = symResults.map((it, i) =>
+      `<div class="sug-item${i === symActive ? " active" : ""}" data-i="${i}">
+        <span class="sug-sym">${it.symbol}</span>
+        <span class="sug-name">${it.name || ""}</span>
+        <span class="sug-ex">${it.exchange || ""}</span>
+      </div>`).join("");
+    symSuggest.querySelectorAll(".sug-item").forEach((el) => {
+      el.addEventListener("mousedown", (e) => {   // mousedown beats input blur
+        e.preventDefault();
+        pickSymbol(symResults[+el.dataset.i].symbol);
+      });
+    });
+  }
+  positionSymSuggest();
+  symSuggest.classList.add("open");
+}
+
+function pickSymbol(sym) {
+  symInput.value = sym;
+  closeSymSuggest();
+  loadData();
+}
+
+async function fetchSymSuggest(q) {
+  const mySeq = ++symSeq;
+  try {
+    const res = await (await fetch("/api/search?q=" + encodeURIComponent(q))).json();
+    if (mySeq !== symSeq) return;   // a newer query superseded this one
+    symResults = res.results || [];
+    symActive = -1;
+    if (document.activeElement === symInput) renderSymSuggest();
+  } catch (e) { /* search is best-effort */ }
+}
+
+symInput.addEventListener("input", () => {
+  const q = symInput.value.trim();
+  clearTimeout(symDebounce);
+  if (q.length < 1) { closeSymSuggest(); return; }
+  symDebounce = setTimeout(() => fetchSymSuggest(q), 180);
+});
+
+symInput.addEventListener("keydown", (e) => {
+  const open = symSuggest.classList.contains("open") && symResults.length;
+  if (e.key === "ArrowDown" && open) {
+    e.preventDefault(); symActive = (symActive + 1) % symResults.length; renderSymSuggest();
+  } else if (e.key === "ArrowUp" && open) {
+    e.preventDefault(); symActive = (symActive - 1 + symResults.length) % symResults.length; renderSymSuggest();
+  } else if (e.key === "Enter") {
+    if (open && symActive >= 0) { e.preventDefault(); pickSymbol(symResults[symActive].symbol); }
+    else { closeSymSuggest(); loadData(); }
+  } else if (e.key === "Escape") {
+    closeSymSuggest();
+  }
+});
+
+symInput.addEventListener("focus", () => { if (symResults.length && symInput.value.trim()) renderSymSuggest(); });
+symInput.addEventListener("blur", () => setTimeout(closeSymSuggest, 120));
+window.addEventListener("resize", () => { if (symSuggest.classList.contains("open")) positionSymSuggest(); });
 
 // ── Watchlist UI ──
 const wlStar = document.getElementById("wl-star");
@@ -3493,6 +3637,147 @@ const Alerts = (() => {
   return { openPanel };
 })();
 
+// ═══════════════════════════ Overview panel ═══════════════════════════
+// Fundamentals + analyst-opinion snapshot for the active ticker (Yahoo
+// Finance's "info" blob, curated server-side). Opened by clicking the
+// symbol/name in the price legend.
+const Overview = (() => {
+  const dlg = document.getElementById("overview-dlg");
+  const body = document.getElementById("overview-body");
+  let reqSeq = 0;
+
+  function fmtBig(v) {
+    if (v == null) return "—";
+    const a = Math.abs(v);
+    if (a >= 1e12) return (v / 1e12).toFixed(2) + "T";
+    if (a >= 1e9) return (v / 1e9).toFixed(2) + "B";
+    if (a >= 1e6) return (v / 1e6).toFixed(2) + "M";
+    if (a >= 1e3) return (v / 1e3).toFixed(2) + "K";
+    return (+v).toFixed(2);
+  }
+  function fmtPct(v) { return v == null ? "—" : (v * 100).toFixed(2) + "%"; }
+  function fmtNum(v, d = 2) { return v == null ? "—" : (+v).toFixed(d); }
+  function fmtPrice(v) { return v == null ? "—" : "$" + (+v).toFixed(2); }
+
+  function recClass(key) {
+    if (!key) return "none";
+    const k = key.toLowerCase();
+    if (k.includes("strong_buy") || k.includes("strongbuy")) return "strong_buy";
+    if (k.includes("buy")) return "buy";
+    if (k.includes("hold")) return "hold";
+    if (k.includes("strong_sell") || k.includes("strongsell")) return "strong_sell";
+    if (k.includes("sell") || k.includes("underperform")) return "sell";
+    return "none";
+  }
+
+  function rangeBar(low, high, current) {
+    if (low == null || high == null || high <= low) return "";
+    const pct = current == null ? null : Math.max(0, Math.min(100, ((current - low) / (high - low)) * 100));
+    return `<div class="ov-range-bar">${pct == null ? "" : `<span class="ov-range-dot" style="left:${pct}%"></span>`}</div>`;
+  }
+
+  function targetBar(o) {
+    const { targetLowPrice: lo, targetHighPrice: hi, targetMeanPrice: mean, currentPrice: cur } = o;
+    if (lo == null || hi == null || hi <= lo) return "";
+    const clamp = (v) => Math.max(0, Math.min(100, ((v - lo) / (hi - lo)) * 100));
+    const meanPct = mean == null ? null : clamp(mean);
+    const curPct = cur == null ? null : clamp(cur);
+    return `
+      <div class="ov-target-bar">
+        ${curPct != null ? `<span class="ov-target-fill" style="left:0;width:${curPct}%"></span>` : ""}
+        ${meanPct != null ? `<span class="ov-target-dot" style="left:${meanPct}%;background:${C.yellow}" title="Mean target ${fmtPrice(mean)}"></span>` : ""}
+      </div>
+      <div class="ov-target-labels"><span>${fmtPrice(lo)}</span><span>${fmtPrice(hi)}</span></div>`;
+  }
+
+  function stat(label, value) {
+    return `<div class="ov-stat"><div class="ov-k">${label}</div><div class="ov-v">${value}</div></div>`;
+  }
+
+  function render(o) {
+    if (!o || !o.hasData) {
+      body.innerHTML = `<div class="ov-empty">No fundamentals available for ${o ? o.symbol : "this symbol"}.<br>Coverage is best for major US-listed stocks.</div>`;
+      return;
+    }
+    const rc = recClass(o.recommendationKey);
+    const recLabel = o.recommendationKey ? o.recommendationKey.replace(/_/g, " ") : "No rating";
+    body.innerHTML = `
+      <div class="ov-head-row">
+        <span class="ov-sym">${o.symbol}</span>
+        <span class="ov-name">${o.name || ""}</span>
+      </div>
+      <div class="ov-sub">${[o.sector, o.industry, o.exchange].filter(Boolean).join(" · ") || "—"}</div>
+
+      <div class="ov-price-row">
+        <span class="ov-price">${fmtPrice(o.currentPrice)}</span>
+      </div>
+      <div class="ov-range">
+        <span>52-Week Range&nbsp;·&nbsp;${fmtPrice(o.fiftyTwoWeekLow)} – ${fmtPrice(o.fiftyTwoWeekHigh)}</span>
+        ${rangeBar(o.fiftyTwoWeekLow, o.fiftyTwoWeekHigh, o.currentPrice)}
+      </div>
+
+      <div class="dlg-group">KEY STATS</div>
+      <div class="ov-grid">
+        ${stat("Market Cap", fmtBig(o.marketCap))}
+        ${stat("P/E (TTM)", fmtNum(o.trailingPE))}
+        ${stat("Forward P/E", fmtNum(o.forwardPE))}
+        ${stat("Beta", fmtNum(o.beta))}
+        ${stat("Dividend Yield", fmtPct(o.dividendYield))}
+        ${stat("Payout Ratio", fmtPct(o.payoutRatio))}
+        ${stat("Profit Margin", fmtPct(o.profitMargins))}
+        ${stat("Return on Equity", fmtPct(o.returnOnEquity))}
+        ${stat("Revenue Growth", fmtPct(o.revenueGrowth))}
+        ${stat("Total Cash", fmtBig(o.totalCash))}
+        ${stat("Total Debt", fmtBig(o.totalDebt))}
+      </div>
+
+      <div class="dlg-group">ANALYST OPINION</div>
+      <div class="ov-rec-row">
+        <span class="ov-rec-badge ${rc}">${recLabel}</span>
+        <span class="ov-sub">${o.numberOfAnalystOpinions != null ? o.numberOfAnalystOpinions + " analysts" : "No coverage"}</span>
+      </div>
+      ${o.targetMeanPrice != null ? `
+      <div class="ov-sub" style="margin-top:8px">Price target range (mean ${fmtPrice(o.targetMeanPrice)})</div>
+      ${targetBar(o)}` : ""}
+
+      ${o.longBusinessSummary ? `
+      <div class="dlg-group">ABOUT</div>
+      <div class="ov-summary">${o.longBusinessSummary}</div>` : ""}
+    `;
+  }
+
+  async function open(symbol) {
+    dlg.classList.add("open");
+    body.innerHTML = `<div class="ov-loading">Loading…</div>`;
+    const mySeq = ++reqSeq;
+    try {
+      const res = await fetch("/api/overview?symbol=" + encodeURIComponent(symbol));
+      const data = await res.json();
+      if (mySeq !== reqSeq) return;   // superseded by a newer request
+      if (data.error) { body.innerHTML = `<div class="ov-empty">Couldn't load overview: ${data.error}</div>`; return; }
+      render(data);
+    } catch (e) {
+      if (mySeq !== reqSeq) return;
+      body.innerHTML = `<div class="ov-empty">Couldn't load overview.</div>`;
+    }
+  }
+
+  function close() { dlg.classList.remove("open"); }
+
+  document.getElementById("overview-close").addEventListener("click", close);
+  dlg.querySelector(".dlg-backdrop").addEventListener("click", close);
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape" && dlg.classList.contains("open")) close(); });
+
+  // Delegated click: the legend re-renders its innerHTML on every tick/
+  // crosshair move, so bind once on the stable container instead of per-render.
+  lgPrice.addEventListener("click", (e) => {
+    const el = e.target.closest("#lg-overview-sym, #lg-overview-btn");
+    if (el && lastData) open(lastData.symbol);
+  });
+
+  return { open };
+})();
+
 async function init() {
   try {
     const cat = await (await fetch("/api/catalog")).json();
@@ -3508,5 +3793,6 @@ async function init() {
   await loadData();
   // No default indicators — a fresh ticker starts as a clean price + volume
   // chart; saved layouts (per ticker) are restored automatically on load.
+  startLivePolling();
 }
 init();

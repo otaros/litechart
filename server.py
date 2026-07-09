@@ -1,9 +1,10 @@
 """
 LiteChart — web backend.
 
-Serves OHLCV data (downloaded from Yahoo Finance) plus server-computed
-indicators as JSON, and hosts a single-page frontend that renders everything
-with TradingView Lightweight Charts (loaded from a CDN).
+Serves OHLCV data (Alpaca, with automatic Yahoo Finance fallback — see
+DATA_PROVIDER in .env) plus server-computed indicators as JSON, and hosts a
+single-page frontend that renders everything with TradingView Lightweight
+Charts (loaded from a CDN).
 
 Run:
     conda run -n py3 python server.py
@@ -18,17 +19,69 @@ import ssl
 import subprocess
 import tempfile
 import time
+from datetime import datetime, timedelta, timezone
 
-# Disable SSL verification — must happen before any network import.
-os.environ["PYTHONHTTPSVERIFY"] = "0"
-os.environ["CURL_CA_BUNDLE"] = ""
-os.environ["REQUESTS_CA_BUNDLE"] = ""
-ssl._create_default_https_context = ssl._create_unverified_context
+def _probe_ssl_ok(url: str = "https://query1.finance.yahoo.com", timeout: float = 5) -> bool:
+    """Try a real HTTPS request with certificate verification ON.
+
+    Uses `requests` (certifi's CA bundle) rather than the stdlib `ssl`
+    module, because on Windows `ssl.create_default_context()` trusts the OS
+    certificate store — which corporate IT may have seeded with its
+    TLS-inspection root — while `requests`/`curl_cffi`/alpaca-py all verify
+    against certifi's bundle instead and would still fail. Probing with the
+    same mechanism the app actually uses avoids that false negative.
+
+    Returns True (stay secure) unless the request fails specifically because
+    of a broken/untrusted cert chain. Any other failure (offline, DNS,
+    timeout) also returns True, since that's not evidence verification
+    itself is the problem.
+    """
+    import requests as _bootstrap_requests
+    try:
+        _bootstrap_requests.get(url, timeout=timeout)
+        return True
+    except _bootstrap_requests.exceptions.SSLError:
+        return False
+    except Exception:
+        return True
+
+
+# Verify TLS certs normally first; only relax verification process-wide if a
+# real probe proves this machine's network can't validate the chain.
+_SSL_VERIFY = _probe_ssl_ok()
+
+if not _SSL_VERIFY:
+    print("[litechart] TLS certificate verification failed for outbound HTTPS "
+          "(likely a corporate proxy/SSL-inspection root Python doesn't trust). "
+          "Falling back to unverified HTTPS for outbound market-data requests only.")
+    os.environ["PYTHONHTTPSVERIFY"] = "0"
+    os.environ["CURL_CA_BUNDLE"] = ""
+    os.environ["REQUESTS_CA_BUNDLE"] = ""
+    ssl._create_default_https_context = ssl._create_unverified_context
+    try:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    except Exception:
+        pass
+    # `requests.Session` (used internally by libs like alpaca-py that don't
+    # expose a verify= knob) still checks certs against certifi by default —
+    # patch it too so those calls don't fail with the same error.
+    try:
+        import requests as _rq_bootstrap
+        _orig_session_request = _rq_bootstrap.Session.request
+
+        def _unverified_session_request(self, *args, **kwargs):
+            kwargs.setdefault("verify", False)
+            return _orig_session_request(self, *args, **kwargs)
+
+        _rq_bootstrap.Session.request = _unverified_session_request
+    except Exception:
+        pass
 
 # Impersonate Chrome so Yahoo Finance doesn't block/rate-limit us.
 try:
     from curl_cffi.requests import Session as CurlSession
-    _YF_SESSION = CurlSession(impersonate="chrome120", verify=False, timeout=20)
+    _YF_SESSION = CurlSession(impersonate="chrome120", verify=_SSL_VERIFY, timeout=20)
 except Exception:
     _YF_SESSION = None
 
@@ -36,6 +89,39 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 from flask import Flask, jsonify, render_template, request
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+except ImportError:
+    pass
+
+# ─────────────────────────── Data provider ─────────────────────────────
+# "alpaca" (with automatic Yahoo fallback for anything Alpaca can't serve —
+# indices, FX, obscure/foreign tickers) or "yahoo" (Yahoo only). Configured
+# via .env, which is git-ignored — see .env.example.
+DATA_PROVIDER = (os.environ.get("DATA_PROVIDER") or "yahoo").strip().lower()
+ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY") or ""
+ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY") or ""
+ALPACA_FEED = (os.environ.get("ALPACA_FEED") or "iex").strip().lower()
+ALPACA_FALLBACK_YAHOO = (os.environ.get("ALPACA_FALLBACK_YAHOO") or "1").strip() not in ("0", "false", "no")
+
+_ALPACA_CLIENT = None
+_AlpacaAPIError = Exception
+if DATA_PROVIDER == "alpaca":
+    if not (ALPACA_API_KEY and ALPACA_SECRET_KEY):
+        print("[litechart] DATA_PROVIDER=alpaca but ALPACA_API_KEY/ALPACA_SECRET_KEY "
+              "are missing in .env — using Yahoo Finance only.")
+    else:
+        try:
+            from alpaca.data.historical import StockHistoricalDataClient
+            from alpaca.common.exceptions import APIError as _AlpacaAPIError
+            _ALPACA_CLIENT = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+            print(f"[litechart] Data provider: Alpaca (feed={ALPACA_FEED}), "
+                  f"Yahoo fallback: {'on' if ALPACA_FALLBACK_YAHOO else 'off'}")
+        except Exception as e:  # noqa: BLE001
+            print(f"[litechart] Alpaca init failed ({e}) — using Yahoo Finance only.")
+            _ALPACA_CLIENT = None
 
 
 # ─────────────────────────── Indicators ───────────────────────────────
@@ -385,6 +471,30 @@ _RESAMPLE = {
     "4h":  "4h",
 }
 
+# Alpaca timeframe mapping: (native bar size to request, how far back to
+# start). Mirrors PERIOD_MAP's native/resample split above so both providers
+# feed the exact same _RESAMPLE step and produce identical bar boundaries.
+if _ALPACA_CLIENT is not None:
+    from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+
+    _ALPACA_TF_MAP = {
+        "1m":  (TimeFrame(1, TimeFrameUnit.Minute),  timedelta(days=7)),
+        "2m":  (TimeFrame(2, TimeFrameUnit.Minute),  timedelta(days=7)),
+        "3m":  (TimeFrame(1, TimeFrameUnit.Minute),  timedelta(days=7)),
+        "5m":  (TimeFrame(5, TimeFrameUnit.Minute),  timedelta(days=60)),
+        "10m": (TimeFrame(5, TimeFrameUnit.Minute),  timedelta(days=60)),
+        "15m": (TimeFrame(15, TimeFrameUnit.Minute), timedelta(days=60)),
+        "30m": (TimeFrame(30, TimeFrameUnit.Minute), timedelta(days=60)),
+        "45m": (TimeFrame(15, TimeFrameUnit.Minute), timedelta(days=60)),
+        "1h":  (TimeFrame(1, TimeFrameUnit.Hour),    timedelta(days=730)),
+        "2h":  (TimeFrame(1, TimeFrameUnit.Hour),    timedelta(days=730)),
+        "3h":  (TimeFrame(1, TimeFrameUnit.Hour),    timedelta(days=730)),
+        "4h":  (TimeFrame(1, TimeFrameUnit.Hour),    timedelta(days=730)),
+        "1D":  (TimeFrame(1, TimeFrameUnit.Day),     timedelta(days=365 * 20)),
+        "1W":  (TimeFrame(1, TimeFrameUnit.Week),    timedelta(days=365 * 20)),
+        "1M":  (TimeFrame(1, TimeFrameUnit.Month),   timedelta(days=365 * 20)),
+    }
+
 # TradingView palette (used for volume / MACD histogram point colors)
 C_GREEN = "#26a69a"
 C_RED = "#ef5350"
@@ -406,9 +516,29 @@ def fetch_df(symbol: str, timeframe: str) -> pd.DataFrame:
     return df
 
 
-# Company long-name lookup, cached separately (rarely changes, so a long TTL).
-_NAME_CACHE: dict = {}          # symbol -> (fetched_at, name)
-_NAME_TTL = 24 * 3600           # 1 day
+# Yahoo's raw "info" blob (name, sector, valuation, analyst ratings, …) is
+# expensive-ish and rarely changes, so it's fetched once and shared by both
+# fetch_name() and fetch_overview() via this cache.
+_INFO_CACHE: dict = {}          # symbol -> (fetched_at, info dict)
+_INFO_TTL = 3600                # 1 hour — analyst data updates infrequently
+
+
+def _fetch_yf_info(symbol: str) -> dict:
+    sym = symbol.upper()
+    cached = _INFO_CACHE.get(sym)
+    if cached is not None and (time.time() - cached[0]) < _INFO_TTL:
+        return cached[1]
+    info = {}
+    try:
+        tk = yf.Ticker(sym, session=_YF_SESSION)
+        try:
+            info = tk.get_info() or {}
+        except Exception:  # noqa: BLE001
+            info = getattr(tk, "info", {}) or {}
+    except Exception:  # noqa: BLE001
+        info = {}
+    _INFO_CACHE[sym] = (time.time(), info)
+    return info
 
 
 def fetch_name(symbol: str) -> str:
@@ -418,28 +548,79 @@ def fetch_name(symbol: str) -> str:
     a slow or failed metadata call never blocks the price payload.
     """
     sym = symbol.upper()
-    cached = _NAME_CACHE.get(sym)
-    if cached is not None and (time.time() - cached[0]) < _NAME_TTL:
-        return cached[1]
-    name = ""
-    try:
-        tk = yf.Ticker(sym, session=_YF_SESSION)
-        info = {}
-        try:
-            info = tk.get_info() or {}
-        except Exception:  # noqa: BLE001
-            info = getattr(tk, "info", {}) or {}
-        name = (info.get("longName") or info.get("shortName")
-                or info.get("displayName") or "").strip()
-    except Exception:  # noqa: BLE001
-        name = ""
-    if not name:
-        name = sym
-    _NAME_CACHE[sym] = (time.time(), name)
-    return name
+    info = _fetch_yf_info(sym)
+    name = (info.get("longName") or info.get("shortName")
+            or info.get("displayName") or "").strip()
+    return name or sym
 
 
-def _fetch_df_uncached(symbol: str, timeframe: str) -> pd.DataFrame:
+def fetch_overview(symbol: str) -> dict:
+    """Curated fundamentals + analyst-opinion snapshot for the Overview panel.
+
+    Best-effort: any missing field is simply omitted (None) rather than
+    failing the whole request — coverage varies a lot by ticker (large caps
+    are rich, small caps/ETFs/indices are often sparse).
+    """
+    sym = symbol.upper()
+    info = _fetch_yf_info(sym)
+
+    def g(*keys):
+        for k in keys:
+            v = info.get(k)
+            if v is not None:
+                return v
+        return None
+
+    out = {
+        "symbol": sym,
+        "name": g("longName", "shortName", "displayName") or sym,
+        "sector": g("sector"),
+        "industry": g("industry"),
+        "exchange": g("fullExchangeName", "exchange"),
+        "currency": g("currency"),
+        "marketCap": g("marketCap"),
+        "trailingPE": g("trailingPE"),
+        "forwardPE": g("forwardPE"),
+        "beta": g("beta"),
+        "dividendYield": g("dividendYield"),
+        "payoutRatio": g("payoutRatio"),
+        "fiftyTwoWeekLow": g("fiftyTwoWeekLow"),
+        "fiftyTwoWeekHigh": g("fiftyTwoWeekHigh"),
+        "profitMargins": g("profitMargins"),
+        "returnOnEquity": g("returnOnEquity"),
+        "revenueGrowth": g("revenueGrowth"),
+        "earningsGrowth": g("earningsGrowth"),
+        "totalCash": g("totalCash"),
+        "totalDebt": g("totalDebt"),
+        "recommendationKey": g("recommendationKey"),
+        "recommendationMean": g("recommendationMean"),
+        "numberOfAnalystOpinions": g("numberOfAnalystOpinions"),
+        "targetLowPrice": g("targetLowPrice"),
+        "targetMeanPrice": g("targetMeanPrice"),
+        "targetMedianPrice": g("targetMedianPrice"),
+        "targetHighPrice": g("targetHighPrice"),
+        "currentPrice": g("currentPrice", "regularMarketPrice"),
+        "longBusinessSummary": g("longBusinessSummary"),
+    }
+    # True if Yahoo gave us essentially nothing useful (e.g. delisted/obscure
+    # symbol) so the UI can show a clear "no data" state instead of all dashes.
+    out["hasData"] = any(v is not None for k, v in out.items()
+                         if k not in ("symbol", "name", "hasData"))
+    return out
+
+
+def _resample_ohlcv(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+    rule = _RESAMPLE.get(timeframe)
+    if not rule:
+        return df
+    return df.resample(rule).agg({
+        "Open": "first", "High": "max",
+        "Low": "min", "Close": "last",
+        "Volume": "sum",
+    }).dropna()
+
+
+def _fetch_yahoo_df(symbol: str, timeframe: str) -> pd.DataFrame:
     period, interval = PERIOD_MAP.get(timeframe, ("1y", "1d"))
     last_err = ""
     for attempt in range(3):
@@ -453,13 +634,7 @@ def _fetch_df_uncached(symbol: str, timeframe: str) -> pd.DataFrame:
                 last_err = f"No data for '{symbol}' — check the symbol."
                 continue
             df.index = pd.to_datetime(df.index, utc=True).tz_convert(None)
-            rule = _RESAMPLE.get(timeframe)
-            if rule:
-                df = df.resample(rule).agg({
-                    "Open": "first", "High": "max",
-                    "Low": "min", "Close": "last",
-                    "Volume": "sum",
-                }).dropna()
+            df = _resample_ohlcv(df, timeframe)
             df = df[~df.index.duplicated(keep="last")].sort_index()
             return df
         except Exception as e:  # noqa: BLE001
@@ -468,6 +643,49 @@ def _fetch_df_uncached(symbol: str, timeframe: str) -> pd.DataFrame:
                 continue
             break
     raise RuntimeError(last_err or "Unknown fetch error")
+
+
+def _fetch_alpaca_df(symbol: str, timeframe: str) -> pd.DataFrame:
+    """Raises on any failure (bad/unsupported symbol, auth, rate limit, no
+    data) so the caller can decide whether to fall back to Yahoo.
+    """
+    from alpaca.data.requests import StockBarsRequest
+
+    tf_obj, lookback = _ALPACA_TF_MAP.get(timeframe, _ALPACA_TF_MAP["1D"])
+    req = StockBarsRequest(
+        symbol_or_symbols=symbol,
+        timeframe=tf_obj,
+        start=datetime.now(timezone.utc) - lookback,
+        feed=ALPACA_FEED,
+    )
+    bars = _ALPACA_CLIENT.get_stock_bars(req)
+    df = bars.df
+    if df is None or df.empty:
+        raise RuntimeError(f"Alpaca returned no data for '{symbol}'.")
+    # get_stock_bars(...).df is MultiIndex (symbol, timestamp) even for a
+    # single symbol — drop the symbol level to get a plain time series.
+    if isinstance(df.index, pd.MultiIndex):
+        df = df.xs(symbol, level=0)
+    df = df.rename(columns={
+        "open": "Open", "high": "High", "low": "Low",
+        "close": "Close", "volume": "Volume",
+    })[["Open", "High", "Low", "Close", "Volume"]]
+    df.index = pd.to_datetime(df.index, utc=True).tz_convert(None)
+    df = _resample_ohlcv(df, timeframe)
+    df = df[~df.index.duplicated(keep="last")].sort_index()
+    return df
+
+
+def _fetch_df_uncached(symbol: str, timeframe: str) -> pd.DataFrame:
+    if _ALPACA_CLIENT is not None:
+        try:
+            return _fetch_alpaca_df(symbol, timeframe)
+        except Exception as e:  # noqa: BLE001
+            if not ALPACA_FALLBACK_YAHOO:
+                raise
+            print(f"[litechart] Alpaca fetch failed for '{symbol}' ({timeframe}): {e} "
+                  f"— falling back to Yahoo Finance.")
+    return _fetch_yahoo_df(symbol, timeframe)
 
 
 # ─────────────────────────── Serialization ────────────────────────────
@@ -749,7 +967,6 @@ def compute_indicator(symbol: str, timeframe: str, ind_type: str, params: dict) 
 # user-editable JSON message (placeholders like {{ticker}}, {{price}} filled in).
 import json
 import threading
-from datetime import datetime, timezone
 
 try:
     import requests as _requests
@@ -908,10 +1125,10 @@ def _send_webhook(alert: dict, ctx: dict) -> dict:
         return {"ok": False, "error": "requests not installed"}
     try:
         if payload_is_json:
-            r = _requests.post(url, json=body, timeout=10, verify=False)
+            r = _requests.post(url, json=body, timeout=10, verify=_SSL_VERIFY)
         else:
             r = _requests.post(url, data=body.encode("utf-8"),
-                               headers={"Content-Type": "text/plain"}, timeout=10, verify=False)
+                               headers={"Content-Type": "text/plain"}, timeout=10, verify=_SSL_VERIFY)
         return {"ok": r.status_code < 400, "status": r.status_code}
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": str(e)}
@@ -1043,6 +1260,79 @@ def api_data():
         return jsonify(build_data(symbol, timeframe))
     except Exception as e:  # noqa: BLE001
         return jsonify({"error": str(e)}), 502
+
+
+@app.route("/api/overview")
+def api_overview():
+    symbol = (request.args.get("symbol") or "AAPL").strip().upper()
+    try:
+        return jsonify(fetch_overview(symbol))
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": str(e)}), 502
+
+
+# Short-lived cache for symbol-search queries so repeated keystrokes for the
+# same prefix don't re-hit Yahoo.
+_SEARCH_CACHE: dict = {}
+_SEARCH_TTL = 300.0
+
+
+def search_symbols(query: str, limit: int = 10) -> list:
+    """Proxy Yahoo Finance's symbol search → [{symbol, name, exchange, type}].
+
+    Uses the Chrome-impersonation session (falls back to requests) so Yahoo
+    doesn't block us. Returns [] on any failure — search is best-effort.
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+    key = q.lower()
+    cached = _SEARCH_CACHE.get(key)
+    if cached is not None and (time.time() - cached[0]) < _SEARCH_TTL:
+        return cached[1]
+
+    url = "https://query2.finance.yahoo.com/v1/finance/search"
+    params = {"q": q, "quotesCount": limit, "newsCount": 0,
+              "listsCount": 0, "enableFuzzyQuery": "false"}
+    data = {}
+    try:
+        if _YF_SESSION is not None:
+            r = _YF_SESSION.get(url, params=params, timeout=8)
+            data = r.json()
+        else:
+            import requests as _rq
+            r = _rq.get(url, params=params, timeout=8,
+                        headers={"User-Agent": "Mozilla/5.0"}, verify=_SSL_VERIFY)
+            data = r.json()
+    except Exception:  # noqa: BLE001
+        return []
+
+    out = []
+    for it in (data.get("quotes") or []):
+        sym = (it.get("symbol") or "").strip()
+        if not sym:
+            continue
+        name = (it.get("shortname") or it.get("longname")
+                or it.get("name") or "").strip()
+        out.append({
+            "symbol": sym,
+            "name": name,
+            "exchange": (it.get("exchDisp") or it.get("exchange") or "").strip(),
+            "type": (it.get("quoteType") or it.get("typeDisp") or "").strip(),
+        })
+        if len(out) >= limit:
+            break
+    _SEARCH_CACHE[key] = (time.time(), out)
+    return out
+
+
+@app.route("/api/search")
+def api_search():
+    q = request.args.get("q") or ""
+    try:
+        return jsonify({"results": search_symbols(q)})
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"results": [], "error": str(e)})
 
 
 @app.route("/api/catalog")
